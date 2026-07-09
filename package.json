@@ -1,0 +1,70 @@
+{
+  "name": "clustercode-vscode-extension",
+  "displayName": "ClusterCode",
+  "description": "Open the ClusterCode orchestrator inside VS Code",
+  "version": "0.1.0",
+  "publisher": "clustercode",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clustercodehq/vscode-extension"
+  },
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:clustercode.open",
+    "onCommand:clustercode.reload"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "clustercode.open",
+        "title": "ClusterCode: Open",
+        "icon": "$(server)"
+      },
+      {
+        "command": "clustercode.reload",
+        "title": "ClusterCode: Reload",
+        "icon": "$(refresh)"
+      }
+    ],
+    "configuration": {
+      "title": "ClusterCode",
+      "properties": {
+        "clustercode.extraFrameOrigins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "https://*.clerk.accounts.dev",
+            "https://*.clerk.com"
+          ],
+          "description": "Extra origins the embedded orchestrator is allowed to frame (added to the webview CSP frame-src). The orchestrator's own origin and any origins it redirects to are allowed automatically; this is for origins injected by client-side JS — e.g. the Clerk auth iframe. Add your production auth frontend (e.g. https://clerk.yourdomain.com) here if it gets blocked."
+        }
+      }
+    },
+    "keybindings": []
+  },
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch",
+    "package": "npm run build && node scripts/package-ext.mjs",
+    "install-ext": "npm run package && node scripts/install-ext.mjs",
+    "uninstall-ext": "code --uninstall-extension clustercode.clustercode-vscode-extension",
+    "test": "tsx --test tests/unit/url-guard.spec.ts tests/unit/orchestrator-url.spec.ts tests/e2e/extension/activation.spec.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.74.0",
+    "esbuild": "^0.20.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

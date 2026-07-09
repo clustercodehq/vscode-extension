@@ -1,0 +1,12 @@
+src/**
+node_modules/**
+scripts/**
+tests/**
+esbuild.config.mjs
+tsconfig.json
+.vscode/**
+.gitignore
+**/*.map
+.superpowers/**
+docs/**
+CLAUDE.md
