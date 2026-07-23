@@ -7,6 +7,15 @@ import { resolveOrchestratorUrl, distinctOrigins } from './orchestrator-url';
 
 type PanelState = 'loading' | 'running' | 'not-running';
 
+/**
+ * Supplies the current embedded bearer token to the webview's data-plane. The
+ * webview (running the orchestrator console at a different origin) has no
+ * session cookie, so it fetches this token from the local broker and attaches
+ * it to its same-origin API calls. Returns undefined when the user hasn't
+ * paired yet.
+ */
+export type EmbedTokenGetter = () => Promise<{ accessToken: string; expiresAt: number } | undefined>;
+
 export class ClusterCodePanel {
   static currentPanel: ClusterCodePanel | undefined;
   private readonly _panel: vscode.WebviewPanel;
@@ -16,12 +25,14 @@ export class ClusterCodePanel {
   private _clipboardServer: http.Server | null = null;
   private _clipboardPort = 0;
   private _clipboardToken = '';
+  private _getEmbeddedToken?: EmbedTokenGetter;
   private readonly _isDev: boolean;
   private _pollTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private constructor(panel: vscode.WebviewPanel, isDev: boolean) {
+  private constructor(panel: vscode.WebviewPanel, isDev: boolean, getEmbeddedToken?: EmbedTokenGetter) {
     this._panel = panel;
     this._isDev = isDev;
+    this._getEmbeddedToken = getEmbeddedToken;
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     this._panel.webview.onDidReceiveMessage(
@@ -61,7 +72,7 @@ export class ClusterCodePanel {
     }
   }
 
-  static createOrShow(extensionUri: vscode.Uri, isDev = false) {
+  static createOrShow(extensionUri: vscode.Uri, isDev = false, getEmbeddedToken?: EmbedTokenGetter) {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
       return;
@@ -80,7 +91,7 @@ export class ClusterCodePanel {
 
     panel.iconPath = vscode.Uri.joinPath(extensionUri, 'images', 'logo-small.png');
 
-    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev);
+    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken);
   }
 
   private _setState(state: PanelState) {
@@ -213,6 +224,24 @@ export class ClusterCodePanel {
               res.end('Failed to open URL');
             }
           });
+        } else if (req.url === '/embed-token' && req.method === 'GET') {
+          // The webview console (different origin, no session cookie) fetches
+          // the current embedded bearer token here to authenticate its
+          // same-origin API calls. Already X-Token-gated above, so only the
+          // extension's own webview (which holds the token) can read it.
+          try {
+            const record = this._getEmbeddedToken ? await this._getEmbeddedToken() : undefined;
+            if (!record) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'not_paired' }));
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ token: record.accessToken, expiresAt: new Date(record.expiresAt).toISOString() }));
+          } catch {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'token_unavailable' }));
+          }
         } else {
           res.writeHead(404);
           res.end();

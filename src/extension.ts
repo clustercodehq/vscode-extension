@@ -64,7 +64,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('clustercode.open', () =>
       ClusterCodePanel.createOrShow(
         context.extensionUri,
-        context.extensionMode === vscode.ExtensionMode.Development
+        context.extensionMode === vscode.ExtensionMode.Development,
+        // Lets the webview console fetch the current embedded bearer token from
+        // the local broker to authenticate its same-origin API calls.
+        () => devicePairing.getEmbeddedToken()
       )
     ),
     vscode.commands.registerCommand('clustercode.reload', () =>
