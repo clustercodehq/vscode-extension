@@ -1,8 +1,19 @@
 import * as vscode from 'vscode';
 import { requestJson } from './httpJson';
+import {
+  mapPollOutcome,
+  isTokenUsable,
+  type EmbeddedTokenRecord,
+  type PollOutcome,
+  type PollResponseBody,
+} from './deviceFlow';
+
+export type { EmbeddedTokenRecord } from './deviceFlow';
 
 const POLL_INTERVAL_MS = 5000;
 const SECRET_KEY = 'clustercode.embeddedToken';
+/** Treat a token expiring within this window as already expired, so it isn't handed to a request it can't outlive. */
+const EXPIRY_SKEW_MS = 30_000;
 
 /** The device/user codes returned once a device-code pairing is started. */
 export interface DeviceCodeSession {
@@ -13,30 +24,11 @@ export interface DeviceCodeSession {
   expiresIn: number;
 }
 
-/** An embedded bearer token minted once a device-code pairing is approved. */
-export interface EmbeddedTokenRecord {
-  accessToken: string;
-  tokenType: string;
-  /** Epoch milliseconds. */
-  expiresAt: number;
-}
-
-type PollOutcome =
-  | { status: 'approved'; token: EmbeddedTokenRecord }
-  | { status: 'pending' | 'denied' | 'expired' };
-
 interface StartResponseBody {
   device_code: string;
   user_code: string;
   verification_uri: string;
   expires_in: number;
-  error?: string;
-}
-
-interface PollResponseBody {
-  access_token?: string;
-  token_type?: string;
-  expires_in?: number;
   error?: string;
 }
 
@@ -96,20 +88,60 @@ export class DevicePairingProvider implements vscode.Disposable {
     }
   }
 
-  /** Returns the stored embedded token, or `undefined` if none is stored (or it fails to parse). */
+  /**
+   * Returns the stored embedded token, or `undefined` if none is stored, it
+   * fails to parse, or it has already expired. Expired tokens are treated as
+   * absent (and cleared) so callers don't waste a round-trip discovering the
+   * 401 — there is no refresh grant to salvage them with in v1.
+   *
+   * A small skew margin means a token about to expire mid-flight is refreshed
+   * proactively rather than failing the request it was picked for.
+   */
   async getEmbeddedToken(): Promise<EmbeddedTokenRecord | undefined> {
     const raw = await this.secrets.get(SECRET_KEY);
     if (!raw) return undefined;
+    let record: EmbeddedTokenRecord;
     try {
-      return JSON.parse(raw) as EmbeddedTokenRecord;
+      record = JSON.parse(raw) as EmbeddedTokenRecord;
     } catch {
       return undefined;
     }
+    if (!isTokenUsable(record, Date.now(), EXPIRY_SKEW_MS)) {
+      await this.clearToken();
+      return undefined;
+    }
+    return record;
   }
 
   /** Deletes the stored embedded token, e.g. after a 401 that couldn't be refreshed. */
   async clearToken(): Promise<void> {
     await this.secrets.delete(SECRET_KEY);
+  }
+
+  /** True if a stored, unexpired embedded token exists (i.e. this instance is paired). */
+  async isSignedIn(): Promise<boolean> {
+    return (await this.getEmbeddedToken()) !== undefined;
+  }
+
+  /**
+   * Signs out: revokes the current token server-side (so a leaked copy stops
+   * working immediately, not just locally) and then clears local storage.
+   * Best-effort on the server call — local deletion always happens.
+   */
+  async signOut(): Promise<void> {
+    const raw = await this.secrets.get(SECRET_KEY);
+    if (raw) {
+      try {
+        const { accessToken } = JSON.parse(raw) as EmbeddedTokenRecord;
+        await requestJson('POST', `${this.orchestratorUrl}/api/auth/embed-token/revoke`, undefined, 10_000, {
+          Authorization: `Bearer ${accessToken}`,
+        });
+      } catch (err) {
+        this.log(`Sign-out server revoke failed (clearing locally anyway): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    await this.clearToken();
+    this.stopPolling();
   }
 
   dispose(): void {
@@ -158,21 +190,7 @@ export class DevicePairingProvider implements vscode.Disposable {
   private async _pollOnce(deviceCode: string): Promise<PollOutcome> {
     const url = `${this.orchestratorUrl}/api/auth/device/poll?device_code=${encodeURIComponent(deviceCode)}`;
     const { body } = await requestJson<PollResponseBody>('GET', url);
-
-    if (body.access_token) {
-      return {
-        status: 'approved',
-        token: {
-          accessToken: body.access_token,
-          tokenType: body.token_type ?? 'Bearer',
-          expiresAt: Date.now() + (body.expires_in ?? 0) * 1000,
-        },
-      };
-    }
-    if (body.error === 'authorization_pending') return { status: 'pending' };
-    if (body.error === 'access_denied') return { status: 'denied' };
-    // expired_token / invalid_grant / anything unrecognized — nothing more polling can do.
-    return { status: 'expired' };
+    return mapPollOutcome(body, Date.now());
   }
 
   private async _storeToken(token: EmbeddedTokenRecord): Promise<void> {
