@@ -300,21 +300,6 @@ export class ClusterCodePanel {
 
   private async _handleMessage(msg: { command: string; text?: string }) {
     switch (msg.command) {
-      case 'startOrchestrator': {
-        const term = vscode.window.createTerminal('ClusterCode: Login');
-        term.show();
-        term.sendText('clustercode login');
-        break;
-      }
-      case 'startWorker': {
-        const term = vscode.window.createTerminal({
-          name: 'ClusterCode: Worker',
-          env: { ORCHESTRATOR_URL: this._orchestratorUrl },
-        });
-        term.show();
-        term.sendText('clustercode worker');
-        break;
-      }
       case 'clipboardWrite':
         if (msg.text) {
           await vscode.env.clipboard.writeText(msg.text);
@@ -456,19 +441,13 @@ export class ClusterCodePanel {
     }
 
     // not-running
-    const wsScheme = this._orchestratorUrl.startsWith('https') ? 'wss' : 'ws';
-    const workerWsUrl = `${wsScheme}://${new URL(this._orchestratorUrl).host}/ws/worker`;
-    // The URL fields are diagnostic only — shown in development (F5) runs, hidden
-    // in a production-built/installed extension.
-    const devFields = this._isDev ? /* html */ `
-    <div class="url-field">
-      <label>Orchestrator URL</label>
-      <input type="text" value="${this._orchestratorUrl}" readonly />
-    </div>
-    <div class="url-field">
-      <label>Worker WebSocket URL</label>
-      <input type="text" value="${workerWsUrl}" readonly />
-    </div>` : '';
+    // The orchestrator URL is diagnostic-only, and only meaningful once a
+    // developer has pointed the extension at a self-hosted instance via the
+    // ORCHESTRATOR_URL env var — the default hosted console needs no such
+    // hint for a normal user. Hidden entirely otherwise.
+    const selfHosted = !!process.env.ORCHESTRATOR_URL;
+    const devFields = selfHosted ? /* html */ `
+    <div class="diagnostic">Trying <code>${this._orchestratorUrl}</code></div>` : '';
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -477,57 +456,17 @@ export class ClusterCodePanel {
   ${styles}
   <style>
     body { display: flex; align-items: center; justify-content: center; overflow-y: auto; }
-    .container { max-width: 560px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; gap: 28px; }
+    .container { max-width: 560px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; }
     .header { display: flex; align-items: center; gap: 12px; }
     .icon { font-size: 28px; }
     .heading { font-size: 18px; font-weight: 600; color: var(--warning); }
-    .section { display: flex; flex-direction: column; gap: 8px; }
-    .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); }
-    pre {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 10px 14px;
+    .message { font-size: 13px; color: var(--text-secondary); }
+    .diagnostic { font-size: 11px; color: var(--text-secondary); }
+    .diagnostic code {
       font-family: var(--vscode-editor-font-family, 'Cascadia Code', monospace);
-      font-size: 12px;
       color: var(--accent-teal);
-      overflow-x: auto;
     }
-    .note { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
-    .url-field { display: flex; flex-direction: column; gap: 6px; }
-    .url-field label { font-size: 12px; color: var(--text-secondary); }
-    .url-field input {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 3px;
-      padding: 6px 10px;
-      font-family: var(--vscode-editor-font-family, 'Cascadia Code', monospace);
-      font-size: 12px;
-      color: var(--text-primary);
-      outline: none;
-    }
-    .url-field input:focus { border-color: var(--status-bar); }
-    .buttons { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    button {
-      padding: 8px 16px;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      font-family: inherit;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s;
-    }
-    /* Primary = ClusterCode brand cyan to match the app; theme-aware so the
-       label stays legible in both light and dark (the old --statusBar-based
-       style rendered white-on-light and vanished in light themes). */
-    .btn-primary { background: #10c0f0; color: #ffffff; }
-    .btn-primary:hover { background: #0eb2df; }
-    body.vscode-light .btn-primary { background: #0080e0; }
-    body.vscode-light .btn-primary:hover { background: #0072c9; }
-    .btn-secondary { background: transparent; color: var(--text-primary); border-color: var(--border); }
-    .btn-secondary:hover { background: var(--bg-secondary); }
-    .waiting { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+    .waiting { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
     .waiting .dot {
       width: 13px; height: 13px;
       border: 2px solid var(--border);
@@ -542,43 +481,20 @@ export class ClusterCodePanel {
   <div class="container">
     <div class="header">
       <span class="icon">⚠️</span>
-      <span class="heading">ClusterCode Orchestrator is not running</span>
+      <span class="heading">Can't reach ClusterCode</span>
     </div>
 
-    <div class="section">
-      <div class="section-title">Install CLI</div>
-      <pre>npm install -g @clustercode/cli</pre>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Getting Started</div>
-      <pre>clustercode login</pre>
-      <div class="note">Authenticate with your ClusterCode account</div>
-      <pre>clustercode worker</pre>
-      <div class="note">Configure tenant and start the worker</div>
-      <pre>clustercode onboard</pre>
-      <div class="note">Guided setup wizard (handles everything)</div>
-    </div>
+    <div class="message">The ClusterCode console isn't responding.</div>
 
     ${devFields}
 
-    <div class="buttons">
-      <button class="btn-primary" data-cmd="startOrchestrator">Start Orchestrator</button>
-      <button class="btn-secondary" data-cmd="startWorker">Start Worker Agent</button>
-    </div>
-
     <div class="waiting">
       <span class="dot"></span>
-      <span>Waiting for the orchestrator… this panel will connect automatically.</span>
+      <span>Retrying automatically…</span>
     </div>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    document.querySelectorAll('[data-cmd]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        vscode.postMessage({ command: btn.dataset.cmd });
-      });
-    });
     document.addEventListener('keydown', (e) => {
       if (!(e.metaKey || e.ctrlKey)) return;
       const el = document.activeElement;
