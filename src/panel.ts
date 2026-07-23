@@ -3,7 +3,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
 import { isAllowedExternalUrl } from './url-guard';
-import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl } from './orchestrator-url';
+import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl, safeHttpOrigin } from './orchestrator-url';
 
 type PanelState = 'loading' | 'running' | 'not-running';
 
@@ -144,21 +144,18 @@ export class ClusterCodePanel {
     if (this._clipboardServer) return Promise.resolve();
 
     this._clipboardToken = crypto.randomBytes(16).toString('hex');
-    // CORS — the only legitimate caller is the embedded webview, which runs
-    // at the orchestrator's origin. Scoping this down (from a former "*")
-    // means only that origin's fetch()/XHR calls can reach the broker at
-    // all; the X-Token check below is still the real guard per request.
-    let allowedOrigin: string | null = null;
-    try {
-      allowedOrigin = new URL(this._orchestratorUrl).origin;
-    } catch {
-      // Malformed ORCHESTRATOR_URL: leave CORS unset rather than crash the
-      // broker. The reachability probe will fail to parse it too, so the
-      // panel settles on the not-running state.
-    }
 
     return new Promise((resolve) => {
       const server = http.createServer(async (req, res) => {
+        // CORS — the only legitimate caller is the embedded webview, which
+        // runs at the orchestrator's origin. Recomputed per request (not
+        // cached at server-start) so a reload that changes the orchestrator
+        // URL picks it up. Fails CLOSED: if the current orchestrator URL
+        // isn't a well-formed http(s) origin, no Access-Control-Allow-Origin
+        // header is sent at all — never "*", and never the literal string
+        // "null" that a scheme-less URL like "localhost:3000" would produce.
+        // The X-Token check below is still the real per-request guard.
+        const allowedOrigin = safeHttpOrigin(this._orchestratorUrl);
         if (allowedOrigin) {
           res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
         }

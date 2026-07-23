@@ -5,6 +5,7 @@ import {
   PROD_ORCHESTRATOR_URL,
   distinctOrigins,
   buildEmbedUrl,
+  safeHttpOrigin,
 } from '../../src/orchestrator-url.ts';
 
 describe('resolveOrchestratorUrl', () => {
@@ -62,6 +63,51 @@ describe('distinctOrigins', () => {
   });
   it('returns an empty array for no input', () => {
     assert.deepEqual(distinctOrigins([]), []);
+  });
+  // Regression: new URL('localhost:3000').origin is the literal string
+  // "null", not a thrown error — a scheme-less URL must not leak that
+  // string into the result as if it were a real origin.
+  it('skips a scheme-less host:port instead of returning the literal "null"', () => {
+    assert.deepEqual(distinctOrigins(['localhost:3000']), []);
+  });
+  it('skips non-http(s) schemes (e.g. file:, data:) instead of returning "null"', () => {
+    assert.deepEqual(distinctOrigins(['file:///etc/passwd', 'data:text/plain,hi']), []);
+  });
+});
+
+describe('safeHttpOrigin', () => {
+  it('returns the origin for an http URL', () => {
+    assert.equal(safeHttpOrigin('http://localhost:3000'), 'http://localhost:3000');
+  });
+  it('returns the origin for an https URL, including a non-default port', () => {
+    assert.equal(safeHttpOrigin('https://console.example.io:8080'), 'https://console.example.io:8080');
+  });
+  it('normalizes away path/query/fragment', () => {
+    assert.equal(safeHttpOrigin('http://localhost:3000/embed?x=1#y'), 'http://localhost:3000');
+  });
+  // Regression (root cause): new URL('localhost:3000') does NOT throw — it
+  // parses as an opaque-origin URL whose .origin is the literal string
+  // "null". A naive try/catch around new URL(...).origin lets that string
+  // through as if it were a real, usable origin. It must return null here.
+  it('returns null for a scheme-less host:port (does not return the string "null")', () => {
+    const result = safeHttpOrigin('localhost:3000');
+    assert.equal(result, null);
+    assert.notEqual(result, 'null');
+  });
+  it('returns null for a non-URL string', () => {
+    assert.equal(safeHttpOrigin('not a url'), null);
+  });
+  it('returns null for a data: URL', () => {
+    assert.equal(safeHttpOrigin('data:text/plain,hello'), null);
+  });
+  it('returns null for a file: URL', () => {
+    assert.equal(safeHttpOrigin('file:///etc/passwd'), null);
+  });
+  it('returns null for undefined', () => {
+    assert.equal(safeHttpOrigin(undefined), null);
+  });
+  it('returns null for an empty string', () => {
+    assert.equal(safeHttpOrigin(''), null);
   });
 });
 
