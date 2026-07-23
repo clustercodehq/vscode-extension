@@ -13,12 +13,26 @@ This extension embeds the ClusterCode orchestrator web UI in a VS Code WebviewPa
 
 | Command | Description |
 |---------|-------------|
-| `ClusterCode: Open` | Opens the ClusterCode panel. Probes the orchestrator and either loads the UI or shows the not-running help screen. |
+| `ClusterCode: Open` | Opens the ClusterCode panel. If you're not signed in, prompts you to sign in first (see [Signing In](#signing-in)) — or open the console without signing in. |
 | `ClusterCode: Reload` | Re-runs the probe and refreshes the panel content. |
+| `ClusterCode: Pair Device` | Starts the sign-in flow directly, without opening the panel. Useful for signing in ahead of time or re-pairing. |
+| `ClusterCode: Sign Out` | Ends the current session and clears the stored credentials for this VS Code instance. |
+
+## Signing In
+
+The console loads without an account, but you need to sign in to see your data.
+
+1. Run **ClusterCode: Open** (or **ClusterCode: Pair Device** to sign in without opening the panel).
+2. If you're not already signed in, choose **Sign In** on the prompt.
+3. A code and a link to open in your browser appear — click **Open in Browser**.
+4. Enter the code (or confirm it) on the page that opens, and approve the request.
+5. VS Code shows a confirmation once sign-in completes, and the console opens automatically (if you started from **Open**) with your data.
+
+You can sign out at any time with **ClusterCode: Sign Out**.
 
 ## Not-Running Screen
 
-When the orchestrator isn't reachable, the panel shows setup guidance and keeps polling — it switches to the live UI automatically once the orchestrator responds (no manual retry):
+When the orchestrator isn't reachable, the panel shows setup guidance and keeps polling — it switches to the live UI automatically once the orchestrator responds (no manual retry). This is separate from signing in (above) — it's about getting a local orchestrator running at all, for development:
 
 - **Start Orchestrator button** — opens a VS Code terminal and runs `clustercode login`
 - **Start Worker Agent button** — opens a VS Code terminal and runs `clustercode worker`

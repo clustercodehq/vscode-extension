@@ -70,7 +70,7 @@
     "package": "npm run build && node scripts/package-ext.mjs",
     "install-ext": "npm run package && node scripts/install-ext.mjs",
     "uninstall-ext": "code --uninstall-extension clustercode.clustercode-vscode-extension",
-    "test": "tsx --test tests/unit/url-guard.spec.ts tests/unit/orchestrator-url.spec.ts tests/unit/deviceFlow.spec.ts tests/e2e/extension/activation.spec.ts"
+    "test": "tsx --test tests/unit/url-guard.spec.ts tests/unit/orchestrator-url.spec.ts tests/unit/deviceFlow.spec.ts tests/unit/openFlow.spec.ts tests/e2e/extension/activation.spec.ts"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
