@@ -18,7 +18,8 @@
   ],
   "activationEvents": [
     "onCommand:clustercode.open",
-    "onCommand:clustercode.reload"
+    "onCommand:clustercode.reload",
+    "onCommand:clustercode.pairDevice"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -32,6 +33,11 @@
         "command": "clustercode.reload",
         "title": "ClusterCode: Reload",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "clustercode.pairDevice",
+        "title": "ClusterCode: Pair Device",
+        "icon": "$(key)"
       }
     ],
     "configuration": {
