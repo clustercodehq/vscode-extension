@@ -14,10 +14,23 @@ export function resolveOrchestratorUrl(env: string | undefined): string {
 }
 
 /**
- * Reduces a list of (possibly redirecting) URLs to the distinct origins they
- * touch, preserving first-seen order. Used to build the webview CSP frame-src
- * so the iframe can follow the orchestrator's auth redirect (e.g. to a portal
- * login on a different port/host). Unparseable entries are skipped.
+ * Builds the URL for the embedded console iframe: the orchestrator's public
+ * embed route, with the given query params appended. Robust to a trailing
+ * slash on the orchestrator URL — a leading "/" in the relative reference
+ * always resolves against the origin, not any existing path.
+ */
+export function buildEmbedUrl(orchestratorUrl: string, params: Record<string, string>): string {
+  const url = new URL('/embed', orchestratorUrl);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  return url.toString();
+}
+
+/**
+ * Reduces a list of URLs to the distinct origins they touch, preserving
+ * first-seen order. Used to build the webview CSP frame-src. Unparseable
+ * entries are skipped.
  */
 export function distinctOrigins(urls: string[]): string[] {
   const seen = new Set<string>();

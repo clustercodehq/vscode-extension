@@ -3,7 +3,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
 import { isAllowedExternalUrl } from './url-guard';
-import { resolveOrchestratorUrl, distinctOrigins } from './orchestrator-url';
+import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl } from './orchestrator-url';
 
 type PanelState = 'loading' | 'running' | 'not-running';
 
@@ -21,7 +21,6 @@ export class ClusterCodePanel {
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
   private _orchestratorUrl: string;
-  private _frameOrigins: string[] = [];
   private _clipboardServer: http.Server | null = null;
   private _clipboardPort = 0;
   private _clipboardToken = '';
@@ -105,9 +104,8 @@ export class ClusterCodePanel {
 
     // ORCHESTRATOR_URL env (developer override for local/UAT) or hosted console.
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
-    const probe = await this._probe(this._orchestratorUrl);
-    this._frameOrigins = probe.origins;
-    if (probe.reachable) {
+    const reachable = await this._probe(this._orchestratorUrl);
+    if (reachable) {
       this._setState('running');
     } else {
       this._setState('not-running');
@@ -130,9 +128,8 @@ export class ClusterCodePanel {
   }
 
   private async _poll() {
-    const probe = await this._probe(this._orchestratorUrl);
-    if (probe.reachable) {
-      this._frameOrigins = probe.origins;
+    const reachable = await this._probe(this._orchestratorUrl);
+    if (reachable) {
       this._setState('running');
     } else {
       this._schedulePoll();
@@ -147,11 +144,24 @@ export class ClusterCodePanel {
     if (this._clipboardServer) return Promise.resolve();
 
     this._clipboardToken = crypto.randomBytes(16).toString('hex');
+    // CORS — the only legitimate caller is the embedded webview, which runs
+    // at the orchestrator's origin. Scoping this down (from a former "*")
+    // means only that origin's fetch()/XHR calls can reach the broker at
+    // all; the X-Token check below is still the real guard per request.
+    let allowedOrigin: string | null = null;
+    try {
+      allowedOrigin = new URL(this._orchestratorUrl).origin;
+    } catch {
+      // Malformed ORCHESTRATOR_URL: leave CORS unset rather than crash the
+      // broker. The reachability probe will fail to parse it too, so the
+      // panel settles on the not-running state.
+    }
 
     return new Promise((resolve) => {
       const server = http.createServer(async (req, res) => {
-        // CORS — the orchestrator iframe is on a different origin
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        if (allowedOrigin) {
+          res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+        }
         res.setHeader('Access-Control-Allow-Headers', 'X-Token, Content-Type');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
 
@@ -262,54 +272,33 @@ export class ClusterCodePanel {
   }
 
   /**
-   * Probes the orchestrator, following its redirect chain (e.g. an
-   * unauthenticated request bouncing to a portal login on another origin).
-   * Returns whether it is reachable (first request got any response) and the
-   * distinct origins touched, so the webview CSP frame-src can permit the
-   * iframe to actually follow that redirect.
+   * Checks whether the embedded console is reachable. The embed route serves
+   * a self-contained anonymous shell with no redirect to chase, so a single
+   * request is enough — any response at all means the orchestrator is up.
    */
-  private _probe(startUrl: string, maxHops = 5): Promise<{ reachable: boolean; origins: string[] }> {
-    const visited: string[] = [];
-    let reachable = false;
-
-    const visit = (current: string, hops: number): Promise<void> =>
-      new Promise((resolve) => {
-        let isHttps: boolean;
-        try {
-          isHttps = new URL(current).protocol === 'https:';
-        } catch {
-          resolve();
-          return;
-        }
-        visited.push(current);
-        // http.get cannot speak TLS — pick the client by protocol so an
-        // https orchestrator (e.g. the hosted console) is reachable.
-        const req = (isHttps ? https : http).get(current, { timeout: 2000 }, (res) => {
-          res.resume();
-          if (hops === 0) reachable = true; // first response = orchestrator is up
-          const location = res.headers.location;
-          const code = res.statusCode ?? 0;
-          if (location && code >= 300 && code < 400 && hops < maxHops) {
-            let next: string;
-            try {
-              next = new URL(location, current).toString();
-            } catch {
-              resolve();
-              return;
-            }
-            visit(next, hops + 1).then(resolve);
-          } else {
-            resolve();
-          }
-        });
-        req.on('error', () => resolve());
-        req.on('timeout', () => {
-          req.destroy();
-          resolve();
-        });
+  private _probe(orchestratorUrl: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let target: string;
+      let isHttps: boolean;
+      try {
+        target = buildEmbedUrl(orchestratorUrl, {});
+        isHttps = new URL(target).protocol === 'https:';
+      } catch {
+        resolve(false);
+        return;
+      }
+      // http.get cannot speak TLS — pick the client by protocol so an https
+      // orchestrator (e.g. the hosted console) is reachable.
+      const req = (isHttps ? https : http).get(target, { timeout: 2000 }, (res) => {
+        res.resume();
+        resolve(true);
       });
-
-    return visit(startUrl, 0).then(() => ({ reachable, origins: distinctOrigins(visited) }));
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(false);
+      });
+    });
   }
 
   private async _handleMessage(msg: { command: string; text?: string }) {
@@ -363,16 +352,14 @@ export class ClusterCodePanel {
     const nonce = this._nonce();
     // Allow fetch to the clipboard server
     const cbOrigin = this._clipboardPort ? `http://127.0.0.1:${this._clipboardPort}` : '';
-    // Allow the orchestrator origin plus any origins it redirects to (e.g. a
-    // portal login), plus configured extras for JS-injected frames such as the
-    // Clerk auth iframe, so the embedded app can complete its auth flow.
-    const redirectOrigins = this._frameOrigins.length
-      ? this._frameOrigins
-      : [this._orchestratorUrl];
+    // Allow the orchestrator origin, plus configured extras for JS-injected
+    // frames such as an auth provider's iframe, so the embedded app can
+    // complete flows that need one.
+    const orchestratorOrigins = distinctOrigins([this._orchestratorUrl]);
     const extraFrameOrigins = vscode.workspace
       .getConfiguration('clustercode')
       .get<string[]>('extraFrameOrigins', []);
-    const frameSrc = [...new Set([...redirectOrigins, ...extraFrameOrigins])].join(' ');
+    const frameSrc = [...new Set([...orchestratorOrigins, ...extraFrameOrigins])].join(' ');
     const csp = [
       `default-src 'none'`,
       `frame-src ${frameSrc}`,
@@ -433,17 +420,15 @@ export class ClusterCodePanel {
 </html>`;
     }
 
-    // Pass clipboard server URL and theme to the orchestrator via query params
-    const vscTheme = this._resolveVscTheme(vscode.window.activeColorTheme.kind);
-    const params = [`_vscTheme=${vscTheme}`];
-    if (this._clipboardPort) {
-      params.push(`_cbUrl=${encodeURIComponent(`http://127.0.0.1:${this._clipboardPort}`)}`);
-      params.push(`_cbToken=${this._clipboardToken}`);
-    }
-    const separator = this._orchestratorUrl.includes('?') ? '&' : '?';
-    const iframeSrc = `${this._orchestratorUrl}${separator}${params.join('&')}`;
-
     if (state === 'running') {
+      // Pass clipboard server URL and theme to the embedded console via query params.
+      const vscTheme = this._resolveVscTheme(vscode.window.activeColorTheme.kind);
+      const embedParams: Record<string, string> = { _vscTheme: vscTheme };
+      if (this._clipboardPort) {
+        embedParams._cbUrl = `http://127.0.0.1:${this._clipboardPort}`;
+        embedParams._cbToken = this._clipboardToken;
+      }
+      const iframeSrc = buildEmbedUrl(this._orchestratorUrl, embedParams);
       return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
