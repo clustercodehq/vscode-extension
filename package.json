@@ -1,7 +1,7 @@
 {
   "name": "clustercode-vscode-extension",
   "displayName": "ClusterCode",
-  "description": "Open the ClusterCode orchestrator inside VS Code",
+  "description": "Run and monitor ClusterCode AI coding agents from a tab inside VS Code.",
   "version": "0.1.0",
   "publisher": "clustercode",
   "license": "Apache-2.0",
@@ -15,6 +15,13 @@
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "clustercode",
+    "ai",
+    "agents",
+    "devbox",
+    "coding-agent"
   ],
   "activationEvents": [
     "onCommand:clustercode.open",
@@ -58,7 +65,7 @@
             "https://*.clerk.accounts.dev",
             "https://*.clerk.com"
           ],
-          "description": "Extra origins the embedded orchestrator is allowed to frame (added to the webview CSP frame-src). The orchestrator's own origin and any origins it redirects to are allowed automatically; this is for origins injected by client-side JS — e.g. the Clerk auth iframe. Add your production auth frontend (e.g. https://clerk.yourdomain.com) here if it gets blocked."
+          "description": "Additional origins the embedded UI is permitted to load in a frame (added to the webview's CSP frame-src). Only needed if an allowed page fails to load."
         }
       }
     },
