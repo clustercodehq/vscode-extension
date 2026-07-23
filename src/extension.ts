@@ -19,10 +19,25 @@ export function activate(context: vscode.ExtensionContext) {
   const devicePairing = new DevicePairingProvider(context.secrets, orchestratorUrl, log);
   embeddedTransport = new HTTPTransport(orchestratorUrl, devicePairing, log);
 
+  // Reflect auth state into a context key so `when` clauses / UI can react, and
+  // tell a returning, already-paired user they're signed in without forcing a
+  // fresh device-code round-trip. We do NOT auto-start a pairing here: doing so
+  // on every activation would spam new codes at users who never asked to sign in.
+  const setSignedIn = (signedIn: boolean) =>
+    void vscode.commands.executeCommand('setContext', 'clustercode.signedIn', signedIn);
+  void devicePairing.isSignedIn().then((signedIn) => {
+    setSignedIn(signedIn);
+    log(signedIn ? 'Already paired — embedded token present.' : 'Not paired — run "ClusterCode: Pair Device" to sign in.');
+  });
+
   context.subscriptions.push(
     authOutput,
     devicePairing,
-    devicePairing.onTokenReceived(() => log('Device pairing flow complete.')),
+    devicePairing.onTokenReceived(() => {
+      setSignedIn(true);
+      log('Device pairing flow complete.');
+      void vscode.window.showInformationMessage('ClusterCode: this VS Code instance is now signed in.');
+    }),
     vscode.commands.registerCommand('clustercode.pairDevice', async () => {
       try {
         const session = await devicePairing.startPairing();
@@ -39,6 +54,12 @@ export function activate(context: vscode.ExtensionContext) {
         log(`Device pairing failed to start: ${message}`);
         void vscode.window.showErrorMessage(`ClusterCode: failed to start device pairing — ${message}`);
       }
+    }),
+    vscode.commands.registerCommand('clustercode.signOut', async () => {
+      await devicePairing.signOut();
+      setSignedIn(false);
+      log('Signed out — embedded token revoked and cleared.');
+      void vscode.window.showInformationMessage('ClusterCode: signed out.');
     }),
     vscode.commands.registerCommand('clustercode.open', () =>
       ClusterCodePanel.createOrShow(
