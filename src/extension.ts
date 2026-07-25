@@ -60,9 +60,11 @@ export function activate(context: vscode.ExtensionContext) {
     ClusterCodePanel.createOrShow(
       context.extensionUri,
       context.extensionMode === vscode.ExtensionMode.Development,
-      // Lets the webview console fetch the current embedded bearer token from
-      // the local broker to authenticate its same-origin API calls.
-      () => devicePairing.getEmbeddedToken()
+      // Decides 'running' vs 'signed-out'.
+      () => devicePairing.getEmbeddedToken(),
+      // Mints the single-use bootstrap code the iframe exchanges for its
+      // session cookie (`${orchestratorUrl}/embed?bc=<code>`).
+      () => devicePairing.getBootstrapCode()
     );
 
   context.subscriptions.push(

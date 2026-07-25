@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { requestJson } from './httpJson';
+import { fetchBootstrapCode } from './bootstrapCode';
 import {
   mapPollOutcome,
   isTokenUsable,
@@ -116,6 +117,24 @@ export class DevicePairingProvider implements vscode.Disposable {
   /** Deletes the stored embedded token, e.g. after a 401 that couldn't be refreshed. */
   async clearToken(): Promise<void> {
     await this.secrets.delete(SECRET_KEY);
+  }
+
+  /**
+   * Mints a single-use bootstrap code for the embedded console iframe, using
+   * the stored embed token as Bearer auth. The webview loads
+   * `${orchestratorUrl}/embed?bc=<code>`, which sets the session cookie the
+   * console authenticates with — the embed token itself never reaches the
+   * webview.
+   *
+   * @throws if there's no stored (unexpired) token, or the mint request
+   * fails — e.g. the token was revoked server-side. Callers minting a code
+   * during a panel render must catch this and fall back to the Sign-In
+   * screen rather than let it crash the render.
+   */
+  async getBootstrapCode(): Promise<string> {
+    const record = await this.getEmbeddedToken();
+    if (!record) throw new Error('Not signed in');
+    return fetchBootstrapCode(this.orchestratorUrl, record.accessToken);
   }
 
   /** True if a stored, unexpired embedded token exists (i.e. this instance is paired). */

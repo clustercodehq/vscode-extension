@@ -8,13 +8,19 @@ import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl, safeHttpOrigin 
 type PanelState = 'loading' | 'running' | 'signed-out' | 'not-running';
 
 /**
- * Supplies the current embedded bearer token to the webview's data-plane. The
- * webview (running the orchestrator console at a different origin) has no
- * session cookie, so it fetches this token from the local broker and attaches
- * it to its same-origin API calls. Returns undefined when the user hasn't
- * paired yet.
+ * Returns the current embedded bearer token (if any), used only to decide
+ * whether to render the 'running' console or the 'signed-out' Sign-In
+ * screen. Returns undefined when the user hasn't paired yet, or the token
+ * has expired/been revoked.
  */
 export type EmbedTokenGetter = () => Promise<{ accessToken: string; expiresAt: number } | undefined>;
+
+/**
+ * Mints a single-use bootstrap code that the webview iframe exchanges (via
+ * `${orchestratorUrl}/embed?bc=<code>`) for an HttpOnly session cookie. The
+ * embed token itself is never handed to the webview.
+ */
+export type BootstrapCodeGetter = () => Promise<string>;
 
 export class ClusterCodePanel {
   static currentPanel: ClusterCodePanel | undefined;
@@ -25,13 +31,22 @@ export class ClusterCodePanel {
   private _clipboardPort = 0;
   private _clipboardToken = '';
   private _getEmbeddedToken?: EmbedTokenGetter;
+  private _getBootstrapCode?: BootstrapCodeGetter;
+  /** Set by `_renderReachable` just before switching to 'running'; consumed once when building the iframe src. */
+  private _bootstrapCode?: string;
   private readonly _isDev: boolean;
   private _pollTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private constructor(panel: vscode.WebviewPanel, isDev: boolean, getEmbeddedToken?: EmbedTokenGetter) {
+  private constructor(
+    panel: vscode.WebviewPanel,
+    isDev: boolean,
+    getEmbeddedToken?: EmbedTokenGetter,
+    getBootstrapCode?: BootstrapCodeGetter
+  ) {
     this._panel = panel;
     this._isDev = isDev;
     this._getEmbeddedToken = getEmbeddedToken;
+    this._getBootstrapCode = getBootstrapCode;
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     this._panel.webview.onDidReceiveMessage(
@@ -71,7 +86,12 @@ export class ClusterCodePanel {
     }
   }
 
-  static createOrShow(extensionUri: vscode.Uri, isDev = false, getEmbeddedToken?: EmbedTokenGetter) {
+  static createOrShow(
+    extensionUri: vscode.Uri,
+    isDev = false,
+    getEmbeddedToken?: EmbedTokenGetter,
+    getBootstrapCode?: BootstrapCodeGetter
+  ) {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
       return;
@@ -90,7 +110,7 @@ export class ClusterCodePanel {
 
     panel.iconPath = vscode.Uri.joinPath(extensionUri, 'images', 'logo-small.png');
 
-    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken);
+    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken, getBootstrapCode);
   }
 
   private _setState(state: PanelState) {
@@ -117,9 +137,25 @@ export class ClusterCodePanel {
   // valid embed token. Without one (never paired, or signed out / token revoked
   // or expired), show a native device-code Sign-In screen rather than the
   // anonymous console shell, which would otherwise look "signed in".
+  //
+  // Signed in additionally requires minting a fresh single-use bootstrap code
+  // (the iframe authenticates via the HttpOnly cookie that code exchanges
+  // for, not the embed token directly). A mint failure — e.g. the token was
+  // revoked server-side since the last check — must degrade to the Sign-In
+  // screen rather than crash the render.
   private async _renderReachable() {
     const token = await this._getEmbeddedToken?.();
-    this._setState(token ? 'running' : 'signed-out');
+    if (!token) {
+      this._setState('signed-out');
+      return;
+    }
+    try {
+      this._bootstrapCode = await this._getBootstrapCode?.();
+    } catch {
+      this._setState('signed-out');
+      return;
+    }
+    this._setState('running');
   }
 
   // Instead of a Retry button, quietly re-probe while the not-running screen is
@@ -240,24 +276,6 @@ export class ClusterCodePanel {
               res.end('Failed to open URL');
             }
           });
-        } else if (req.url === '/embed-token' && req.method === 'GET') {
-          // The webview console (different origin, no session cookie) fetches
-          // the current embedded bearer token here to authenticate its
-          // same-origin API calls. Already X-Token-gated above, so only the
-          // extension's own webview (which holds the token) can read it.
-          try {
-            const record = this._getEmbeddedToken ? await this._getEmbeddedToken() : undefined;
-            if (!record) {
-              res.writeHead(404, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'not_paired' }));
-              return;
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            res.end(JSON.stringify({ token: record.accessToken, expiresAt: new Date(record.expiresAt).toISOString() }));
-          } catch {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'token_unavailable' }));
-          }
         } else {
           res.writeHead(404);
           res.end();
@@ -421,6 +439,9 @@ export class ClusterCodePanel {
       // Pass clipboard server URL and theme to the embedded console via query params.
       const vscTheme = this._resolveVscTheme(vscode.window.activeColorTheme.kind);
       const embedParams: Record<string, string> = { _vscTheme: vscTheme };
+      if (this._bootstrapCode) {
+        embedParams.bc = this._bootstrapCode;
+      }
       if (this._clipboardPort) {
         embedParams._cbUrl = `http://127.0.0.1:${this._clipboardPort}`;
         embedParams._cbToken = this._clipboardToken;
