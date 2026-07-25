@@ -5,7 +5,7 @@ import * as crypto from 'crypto';
 import { isAllowedExternalUrl } from './url-guard';
 import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl, safeHttpOrigin } from './orchestrator-url';
 
-type PanelState = 'loading' | 'running' | 'not-running';
+type PanelState = 'loading' | 'running' | 'signed-out' | 'not-running';
 
 /**
  * Supplies the current embedded bearer token to the webview's data-plane. The
@@ -105,12 +105,21 @@ export class ClusterCodePanel {
     // ORCHESTRATOR_URL env (developer override for local/UAT) or hosted console.
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
     const reachable = await this._probe(this._orchestratorUrl);
-    if (reachable) {
-      this._setState('running');
-    } else {
+    if (!reachable) {
       this._setState('not-running');
       this._schedulePoll();
+      return;
     }
+    await this._renderReachable();
+  }
+
+  // Orchestrator is reachable — but the embedded console only shows data with a
+  // valid embed token. Without one (never paired, or signed out / token revoked
+  // or expired), show a native device-code Sign-In screen rather than the
+  // anonymous console shell, which would otherwise look "signed in".
+  private async _renderReachable() {
+    const token = await this._getEmbeddedToken?.();
+    this._setState(token ? 'running' : 'signed-out');
   }
 
   // Instead of a Retry button, quietly re-probe while the not-running screen is
@@ -130,7 +139,7 @@ export class ClusterCodePanel {
   private async _poll() {
     const reachable = await this._probe(this._orchestratorUrl);
     if (reachable) {
-      this._setState('running');
+      await this._renderReachable();
     } else {
       this._schedulePoll();
     }
@@ -310,6 +319,12 @@ export class ClusterCodePanel {
         this._panel.webview.postMessage({ type: 'clipboardPaste', text });
         break;
       }
+      case 'pairDevice':
+        // The Sign-In screen's button — kick off the device-code flow. On
+        // success the always-on onTokenReceived listener reloads this panel,
+        // swapping the Sign-In screen for the console.
+        void vscode.commands.executeCommand('clustercode.pairDevice');
+        break;
     }
   }
 
@@ -434,6 +449,62 @@ export class ClusterCodePanel {
           iframe.contentWindow.postMessage(msg, '*');
         }
       }
+    });
+  </script>
+</body>
+</html>`;
+    }
+
+    if (state === 'signed-out') {
+      // Native Sign-In screen. The button triggers the device-code flow (opens
+      // the approval page in the system browser) — NOT a Clerk/login form,
+      // which can't work inside the cookie-less, postMessage-blocked webview.
+      return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  ${styles}
+  <style>
+    body { display: flex; align-items: center; justify-content: center; overflow-y: auto; }
+    .container { max-width: 460px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; }
+    .header { display: flex; align-items: center; gap: 12px; }
+    .icon { font-size: 26px; }
+    .heading { font-size: 18px; font-weight: 600; color: var(--text-primary); }
+    .message { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+    .btn-primary {
+      margin-top: 4px;
+      padding: 8px 22px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      background: #10c0f0;
+      color: #ffffff;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: #0eb2df; }
+    body.vscode-light .btn-primary { background: #0080e0; }
+    body.vscode-light .btn-primary:hover { background: #0072c9; }
+    .hint { font-size: 11px; color: var(--text-secondary); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <span class="icon">🔐</span>
+      <span class="heading">Sign in to ClusterCode</span>
+    </div>
+    <div class="message">Connect this VS Code instance to your ClusterCode account to open the console.</div>
+    <button id="signin" class="btn-primary">Sign In</button>
+    <div class="hint">Opens your browser to approve the connection.</div>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    document.getElementById('signin').addEventListener('click', () => {
+      vscode.postMessage({ command: 'pairDevice' });
     });
   </script>
 </body>
