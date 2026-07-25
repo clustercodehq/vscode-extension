@@ -32,6 +32,7 @@ export class ClusterCodePanel {
   private _clipboardToken = '';
   private _getEmbeddedToken?: EmbedTokenGetter;
   private _getBootstrapCode?: BootstrapCodeGetter;
+  private _log?: (message: string) => void;
   /** Set by `_renderReachable` just before switching to 'running'; consumed once when building the iframe src. */
   private _bootstrapCode?: string;
   private readonly _isDev: boolean;
@@ -41,12 +42,14 @@ export class ClusterCodePanel {
     panel: vscode.WebviewPanel,
     isDev: boolean,
     getEmbeddedToken?: EmbedTokenGetter,
-    getBootstrapCode?: BootstrapCodeGetter
+    getBootstrapCode?: BootstrapCodeGetter,
+    log?: (message: string) => void
   ) {
     this._panel = panel;
     this._isDev = isDev;
     this._getEmbeddedToken = getEmbeddedToken;
     this._getBootstrapCode = getBootstrapCode;
+    this._log = log;
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     this._panel.webview.onDidReceiveMessage(
@@ -90,7 +93,8 @@ export class ClusterCodePanel {
     extensionUri: vscode.Uri,
     isDev = false,
     getEmbeddedToken?: EmbedTokenGetter,
-    getBootstrapCode?: BootstrapCodeGetter
+    getBootstrapCode?: BootstrapCodeGetter,
+    log?: (message: string) => void
   ) {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
@@ -110,7 +114,7 @@ export class ClusterCodePanel {
 
     panel.iconPath = vscode.Uri.joinPath(extensionUri, 'images', 'logo-small.png');
 
-    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken, getBootstrapCode);
+    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken, getBootstrapCode, log);
   }
 
   private _setState(state: PanelState) {
@@ -151,7 +155,8 @@ export class ClusterCodePanel {
     }
     try {
       this._bootstrapCode = await this._getBootstrapCode?.();
-    } catch {
+    } catch (e) {
+      this._log?.(`bootstrap code fetch failed: ${e instanceof Error ? e.message : String(e)}`);
       this._setState('signed-out');
       return;
     }

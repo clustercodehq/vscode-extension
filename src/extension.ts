@@ -64,7 +64,8 @@ export function activate(context: vscode.ExtensionContext) {
       () => devicePairing.getEmbeddedToken(),
       // Mints the single-use bootstrap code the iframe exchanges for its
       // session cookie (`${orchestratorUrl}/embed?bc=<code>`).
-      () => devicePairing.getBootstrapCode()
+      () => devicePairing.getBootstrapCode(),
+      log
     );
 
   context.subscriptions.push(
