@@ -121,14 +121,27 @@ export function mapRefreshOutcome(status: number, body: RefreshResponseBody, now
  * before the token's expiry, clamped to at least `minDelayMs` so a
  * near-expired (or already-expired) token refreshes almost immediately
  * instead of scheduling a zero/negative-delay storm.
+ *
+ * `jitterMs` (>0) subtracts a random `[0, jitterMs)` slice so that two
+ * windows which computed the *identical* `expiresAt` (both converged on the
+ * same stored token) do NOT fire their refresh at the same wall-clock
+ * instant. Without this de-sync both would POST the same single-use refresh
+ * token before either's rotation could propagate via
+ * `SecretStorage.onDidChange`; the winner rotates and the loser's now-stale
+ * POST risks tripping the server's reuse detection. Jitter only ever moves
+ * the fire *earlier* (never past `minDelayMs`), so a near-expired salvage is
+ * still near-immediate. `rand` is injectable for deterministic tests.
  */
 export function nextRefreshDelayMs(
   expiresAt: number,
   now: number,
   leadMs = 60_000,
-  minDelayMs = 1_000
+  minDelayMs = 1_000,
+  jitterMs = 0,
+  rand: () => number = Math.random
 ): number {
-  return Math.max(expiresAt - leadMs - now, minDelayMs);
+  const jitter = jitterMs > 0 ? Math.floor(rand() * jitterMs) : 0;
+  return Math.max(expiresAt - leadMs - jitter - now, minDelayMs);
 }
 
 /**

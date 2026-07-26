@@ -19,6 +19,18 @@ const POLL_INTERVAL_MS = 5000;
 const SECRET_KEY = 'clustercode.embeddedToken';
 /** Treat a token expiring within this window as already expired, so it isn't handed to a request it can't outlive. */
 const EXPIRY_SKEW_MS = 30_000;
+/** Silent-refresh timing: fire ~60 s before expiry, never sooner than 1 s. */
+const REFRESH_LEAD_MS = 60_000;
+const REFRESH_MIN_DELAY_MS = 1_000;
+/**
+ * Randomized de-sync applied to the scheduled refresh so two windows sharing
+ * the OS keychain never fire at the same instant off an identical `expiresAt`
+ * (see {@link nextRefreshDelayMs}). 15 s ≫ the sub-second rotate→store→
+ * onDidChange propagation, so the later window always adopts the winner's new
+ * token before it fires — collapsing the coincident same-token double-POST
+ * that would otherwise reach the server's reuse detection.
+ */
+const REFRESH_JITTER_MS = 15_000;
 
 /** The device/user codes returned once a device-code pairing is started. */
 export interface DeviceCodeSession {
@@ -59,6 +71,8 @@ export class DevicePairingProvider implements vscode.Disposable {
   private refreshFailures = 0;
   /** Shared in-flight refresh, so concurrent callers never race two POSTs. */
   private refreshInFlight: Promise<EmbeddedTokenRecord | undefined> | undefined;
+  /** Set by {@link dispose}; guards a refresh that was already in flight from re-arming a timer or firing on a disposed emitter. */
+  private disposed = false;
   private readonly secretChangeSub: vscode.Disposable;
 
   private readonly _onTokenReceived = new vscode.EventEmitter<EmbeddedTokenRecord>();
@@ -199,7 +213,7 @@ export class DevicePairingProvider implements vscode.Disposable {
       this.refreshFailures = 0;
       this._armRefreshTimer(outcome.token);
       this.log('Embedded token silently refreshed (pair rotated).');
-      this._onTokenReceived.fire(outcome.token);
+      if (!this.disposed) this._onTokenReceived.fire(outcome.token);
       return outcome.token;
     }
     if (outcome.kind === 'session-ended') {
@@ -208,7 +222,7 @@ export class DevicePairingProvider implements vscode.Disposable {
       await this.clearToken();
       this._cancelRefreshTimer();
       this.log('Token refresh rejected (401) — session ended, sign-in required.');
-      this._onSessionEnded.fire();
+      if (!this.disposed) this._onSessionEnded.fire();
       return undefined;
     }
     // Transient (404 rollout skew / 5xx / malformed): keep everything, retry later.
@@ -274,6 +288,7 @@ export class DevicePairingProvider implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.stopPolling();
     this._cancelRefreshTimer();
     this.secretChangeSub.dispose();
@@ -361,19 +376,25 @@ export class DevicePairingProvider implements vscode.Disposable {
     this._armRefreshTimer(record);
   }
 
-  /** Schedules the next silent refresh 60 s before the access token expires (clamped ≥ 1 s — see {@link nextRefreshDelayMs}). */
+  /**
+   * Schedules the next silent refresh ~60 s before the access token expires
+   * (clamped ≥ 1 s, de-synced by up to {@link REFRESH_JITTER_MS} across
+   * windows — see {@link nextRefreshDelayMs}). No-op once disposed, so an
+   * in-flight refresh resolving after teardown can't install a dangling timer.
+   */
   private _armRefreshTimer(record: EmbeddedTokenRecord): void {
     this._cancelRefreshTimer();
-    if (!record.refreshToken) return;
-    const delay = nextRefreshDelayMs(record.expiresAt, Date.now());
+    if (this.disposed || !record.refreshToken) return;
+    const delay = nextRefreshDelayMs(record.expiresAt, Date.now(), REFRESH_LEAD_MS, REFRESH_MIN_DELAY_MS, REFRESH_JITTER_MS);
     this.refreshTimer = setTimeout(() => {
       void this.refreshNow();
     }, delay);
   }
 
-  /** Schedules a retry after a transient refresh failure, on bounded exponential backoff. */
+  /** Schedules a retry after a transient refresh failure, on bounded exponential backoff. No-op once disposed. */
   private _armRetryBackoff(): void {
     this._cancelRefreshTimer();
+    if (this.disposed) return;
     const delay = refreshRetryDelayMs(this.refreshFailures);
     this.refreshFailures += 1;
     this.refreshTimer = setTimeout(() => {

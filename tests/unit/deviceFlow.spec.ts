@@ -135,6 +135,29 @@ describe('nextRefreshDelayMs', () => {
     assert.equal(nextRefreshDelayMs(NOW + 600_000, NOW, 120_000, 5_000), 480_000);
     assert.equal(nextRefreshDelayMs(NOW + 100, NOW, 120_000, 5_000), 5_000);
   });
+
+  it('default jitter (0) leaves the delay deterministic', () => {
+    // rand must not even be consulted when jitterMs is 0.
+    const rand = () => {
+      throw new Error('rand should not be called when jitterMs=0');
+    };
+    assert.equal(nextRefreshDelayMs(NOW + 600_000, NOW, 60_000, 1_000, 0, rand), 540_000);
+  });
+
+  it('subtracts a [0, jitterMs) slice so two windows fire at different instants', () => {
+    // Same expiresAt, different rand() → different (earlier) delays.
+    const winA = nextRefreshDelayMs(NOW + 600_000, NOW, 60_000, 1_000, 15_000, () => 0); // no jitter
+    const winB = nextRefreshDelayMs(NOW + 600_000, NOW, 60_000, 1_000, 15_000, () => 0.5); // -7500
+    assert.equal(winA, 540_000, 'jitter only ever moves the fire earlier, never later than the lead point');
+    assert.equal(winB, 540_000 - 7_500);
+    assert.ok(winB < winA, 'two windows off the identical expiry de-sync');
+  });
+
+  it('jitter never delays a near-expired salvage past minDelayMs', () => {
+    // Already-expired token: even the largest jitter can only clamp to minDelayMs,
+    // so a reload/restart salvage stays near-immediate.
+    assert.equal(nextRefreshDelayMs(NOW - 600_000, NOW, 60_000, 1_000, 15_000, () => 0.999), 1_000);
+  });
 });
 
 describe('refreshRetryDelayMs', () => {
