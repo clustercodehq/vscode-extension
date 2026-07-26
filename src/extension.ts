@@ -47,8 +47,15 @@ export function activate(context: vscode.ExtensionContext) {
   // tell a returning, already-paired user they're signed in without forcing a
   // fresh device-code round-trip. We do NOT auto-start a pairing here: doing so
   // on every activation would spam new codes at users who never asked to sign in.
-  const setSignedIn = (signedIn: boolean) =>
+  // `wasSignedIn` latches the last known auth state so onTokenReceived can
+  // distinguish a signed-out→signed-in transition (show the console, toast)
+  // from a silent refresh rotation (~every 9 min — must NOT reload the panel
+  // or re-toast, which would wipe the embedded console's state).
+  let wasSignedIn = false;
+  const setSignedIn = (signedIn: boolean) => {
+    wasSignedIn = signedIn;
     void vscode.commands.executeCommand('setContext', 'clustercode.signedIn', signedIn);
+  };
   void devicePairing.isSignedIn().then((signedIn) => {
     setSignedIn(signedIn);
     log(signedIn ? 'Already paired — embedded token present.' : 'Not paired — run "ClusterCode: Pair Device" to sign in.');
@@ -72,12 +79,22 @@ export function activate(context: vscode.ExtensionContext) {
     authOutput,
     devicePairing,
     devicePairing.onTokenReceived(() => {
+      const isNewSignIn = !wasSignedIn;
       setSignedIn(true);
+      if (!isNewSignIn) return; // Silent refresh rotation — nothing user-visible to do.
       // If the console panel is open (e.g. on the Sign-In screen), reload it so
       // a successful pairing swaps straight to the console.
       ClusterCodePanel.reload();
       log('Device pairing flow complete.');
       void vscode.window.showInformationMessage('ClusterCode: this VS Code instance is now signed in.');
+    }),
+    devicePairing.onSessionEnded(() => {
+      setSignedIn(false);
+      // Drop an open console panel to the Sign-In screen — the session is
+      // authoritatively dead (refresh rejected), not merely transiently broken.
+      ClusterCodePanel.reload();
+      log('Embedded session ended (refresh rejected) — sign-in required.');
+      void vscode.window.showWarningMessage('ClusterCode: your session ended — sign in again.');
     }),
     vscode.commands.registerCommand('clustercode.pairDevice', () => {
       // "Sign In" — surface the panel (Sign-In screen) and start the device-code

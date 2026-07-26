@@ -3,10 +3,14 @@ import { requestJson } from './httpJson';
 import { fetchBootstrapCode } from './bootstrapCode';
 import {
   mapPollOutcome,
+  mapRefreshOutcome,
+  nextRefreshDelayMs,
+  refreshRetryDelayMs,
   isTokenUsable,
   type EmbeddedTokenRecord,
   type PollOutcome,
   type PollResponseBody,
+  type RefreshResponseBody,
 } from './deviceFlow';
 
 export type { EmbeddedTokenRecord } from './deviceFlow';
@@ -36,20 +40,54 @@ interface StartResponseBody {
 /**
  * Drives a device-code pairing (RFC 8628-shaped: start, then poll until
  * approved/denied/expired) against the orchestrator's device auth endpoints,
- * and persists the resulting embedded bearer token in VS Code's
- * {@link vscode.SecretStorage}.
+ * persists the resulting embedded bearer token (+ its rotating refresh token)
+ * in VS Code's {@link vscode.SecretStorage}, and keeps the session alive via
+ * a silent-refresh timer against `/api/auth/embed-refresh`.
+ *
+ * Multi-window safety: the OS keychain behind SecretStorage is shared by
+ * every VS Code window. Refreshes are single-flight per extension host, the
+ * stored record is re-read immediately before every refresh POST (another
+ * window may have already rotated the single-use refresh token), and
+ * {@link vscode.SecretStorage.onDidChange} is used to adopt rotations made
+ * by other windows instead of fighting them (which would trip the server's
+ * refresh-token reuse detection).
  */
 export class DevicePairingProvider implements vscode.Disposable {
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Consecutive `transient` refresh failures, for bounded backoff. Reset on any success. */
+  private refreshFailures = 0;
+  /** Shared in-flight refresh, so concurrent callers never race two POSTs. */
+  private refreshInFlight: Promise<EmbeddedTokenRecord | undefined> | undefined;
+  private readonly secretChangeSub: vscode.Disposable;
+
   private readonly _onTokenReceived = new vscode.EventEmitter<EmbeddedTokenRecord>();
-  /** Fires once an embedded token has been received and stored. */
+  /** Fires whenever an embedded token has been received and stored — initial pairing AND every silent refresh rotation. */
   readonly onTokenReceived = this._onTokenReceived.event;
+
+  private readonly _onSessionEnded = new vscode.EventEmitter<void>();
+  /**
+   * Fires when the server authoritatively ends the session (refresh rejected
+   * with 401): storage has been cleared and the refresh timer cancelled —
+   * the user must pair again. Never fired for transient refresh failures.
+   */
+  readonly onSessionEnded = this._onSessionEnded.event;
 
   constructor(
     private readonly secrets: vscode.SecretStorage,
     private readonly orchestratorUrl: string,
     private readonly log: (message: string) => void = () => {}
-  ) {}
+  ) {
+    // Another window rotating (or deleting) the shared record must not be
+    // fought: adopt it and re-schedule off the new expiry.
+    this.secretChangeSub = this.secrets.onDidChange((e) => {
+      if (e.key === SECRET_KEY) void this._adoptStoredRecord();
+    });
+    // Restart-within-idle resume: if a refresh-capable record survived the
+    // window reload / VS Code restart, re-arm the silent-refresh timer (an
+    // already-expired access token schedules a near-immediate salvage).
+    void this._adoptStoredRecord();
+  }
 
   /**
    * Starts a new device-code pairing and begins polling for approval every
@@ -90,28 +128,93 @@ export class DevicePairingProvider implements vscode.Disposable {
   }
 
   /**
-   * Returns the stored embedded token, or `undefined` if none is stored, it
-   * fails to parse, or it has already expired. Expired tokens are treated as
-   * absent (and cleared) so callers don't waste a round-trip discovering the
-   * 401 — there is no refresh grant to salvage them with in v1.
-   *
-   * A small skew margin means a token about to expire mid-flight is refreshed
-   * proactively rather than failing the request it was picked for.
+   * Returns a *usable* embedded token, or `undefined` if none can be
+   * obtained. An access token that has expired (or is inside the skew
+   * window) but is accompanied by a stored refresh token is salvaged via
+   * {@link refreshNow} rather than treated as absent — expiry no longer
+   * wipes storage. Only a refresh-less record (stored by a pre-refresh
+   * build) is still cleared on expiry, since nothing can revive it.
    */
   async getEmbeddedToken(): Promise<EmbeddedTokenRecord | undefined> {
-    const raw = await this.secrets.get(SECRET_KEY);
-    if (!raw) return undefined;
-    let record: EmbeddedTokenRecord;
+    const record = await this._readStoredRecord();
+    if (!record) return undefined;
+    if (isTokenUsable(record, Date.now(), EXPIRY_SKEW_MS)) return record;
+    if (record.refreshToken) {
+      // Expired but refresh-capable: salvage. Single-flight; re-reads
+      // storage itself, so a rotation by another window is picked up.
+      return this.refreshNow();
+    }
+    await this.clearToken();
+    return undefined;
+  }
+
+  /**
+   * Rotates the stored token pair via `POST /api/auth/embed-refresh`.
+   * Single-flight: concurrent callers (timer tick, 401-retry, panel render)
+   * share ONE in-flight request — never two refresh POSTs at once, which
+   * would consume the same single-use refresh token twice and trip the
+   * server's reuse detection.
+   *
+   * Resolves the freshly rotated record on success. Resolves `undefined`
+   * when there is nothing to salvage (no stored refresh token), when the
+   * server authoritatively ends the session (401 → storage cleared, timer
+   * cancelled, {@link onSessionEnded} fired), or on a transient failure
+   * (404 / 5xx / network / malformed → session and storage KEPT, timer
+   * re-armed on bounded backoff, caller may fall back to CLI SSO).
+   */
+  async refreshNow(): Promise<EmbeddedTokenRecord | undefined> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    this.refreshInFlight = this._doRefresh().finally(() => {
+      this.refreshInFlight = undefined;
+    });
+    return this.refreshInFlight;
+  }
+
+  private async _doRefresh(): Promise<EmbeddedTokenRecord | undefined> {
+    // Re-read immediately before the POST — never refresh a token captured
+    // earlier: another window may have already rotated it (the stored value
+    // is the only one that is still un-consumed).
+    const record = await this._readStoredRecord();
+    if (!record?.refreshToken) return undefined;
+
+    let status: number;
+    let body: RefreshResponseBody;
     try {
-      record = JSON.parse(raw) as EmbeddedTokenRecord;
-    } catch {
+      ({ status, body } = await requestJson<RefreshResponseBody>(
+        'POST',
+        `${this.orchestratorUrl}/api/auth/embed-refresh`,
+        { refresh_token: record.refreshToken },
+        10_000
+      ));
+    } catch (err) {
+      // Network failure / timeout / invalid JSON — transient, NOT a sign-out.
+      this.log(`Token refresh failed (transient, will retry): ${err instanceof Error ? err.message : String(err)}`);
+      this._armRetryBackoff();
       return undefined;
     }
-    if (!isTokenUsable(record, Date.now(), EXPIRY_SKEW_MS)) {
+
+    const outcome = mapRefreshOutcome(status, body, Date.now());
+    if (outcome.kind === 'rotated') {
+      await this._storeToken(outcome.token);
+      this.refreshFailures = 0;
+      this._armRefreshTimer(outcome.token);
+      this.log('Embedded token silently refreshed (pair rotated).');
+      this._onTokenReceived.fire(outcome.token);
+      return outcome.token;
+    }
+    if (outcome.kind === 'session-ended') {
+      // Authoritative: the session is dead (revoked, expired server-side, or
+      // reuse-detected). Clear and stop — no retry storm.
       await this.clearToken();
+      this._cancelRefreshTimer();
+      this.log('Token refresh rejected (401) — session ended, sign-in required.');
+      this._onSessionEnded.fire();
       return undefined;
     }
-    return record;
+    // Transient (404 rollout skew / 5xx / malformed): keep everything, retry later.
+    this.log(`Token refresh unavailable (status ${status}) — keeping session, will retry.`);
+    this._armRetryBackoff();
+    return undefined;
   }
 
   /** Deletes the stored embedded token, e.g. after a 401 that couldn't be refreshed. */
@@ -126,10 +229,10 @@ export class DevicePairingProvider implements vscode.Disposable {
    * console authenticates with — the embed token itself never reaches the
    * webview.
    *
-   * @throws if there's no stored (unexpired) token, or the mint request
-   * fails — e.g. the token was revoked server-side. Callers minting a code
-   * during a panel render must catch this and fall back to the Sign-In
-   * screen rather than let it crash the render.
+   * @throws if there's no stored (unexpired or refreshable) token, or the
+   * mint request fails — e.g. the token was revoked server-side. Callers
+   * minting a code during a panel render must catch this and fall back to
+   * the Sign-In screen rather than let it crash the render.
    */
   async getBootstrapCode(): Promise<string> {
     const record = await this.getEmbeddedToken();
@@ -137,35 +240,45 @@ export class DevicePairingProvider implements vscode.Disposable {
     return fetchBootstrapCode(this.orchestratorUrl, record.accessToken);
   }
 
-  /** True if a stored, unexpired embedded token exists (i.e. this instance is paired). */
+  /** True if a stored, usable-or-refreshable embedded token exists (i.e. this instance is paired). */
   async isSignedIn(): Promise<boolean> {
     return (await this.getEmbeddedToken()) !== undefined;
   }
 
   /**
-   * Signs out: revokes the current token server-side (so a leaked copy stops
+   * Signs out: revokes the session server-side (so a leaked copy stops
    * working immediately, not just locally) and then clears local storage.
-   * Best-effort on the server call — local deletion always happens.
+   * The revoke body carries the stored refresh token — the durable
+   * credential — so sign-out works even when the short-TTL access token has
+   * already expired; a still-live access token is additionally sent as the
+   * Bearer header. Best-effort on the server call — local deletion always
+   * happens.
    */
   async signOut(): Promise<void> {
-    const raw = await this.secrets.get(SECRET_KEY);
-    if (raw) {
+    const record = await this._readStoredRecord();
+    if (record) {
       try {
-        const { accessToken } = JSON.parse(raw) as EmbeddedTokenRecord;
-        await requestJson('POST', `${this.orchestratorUrl}/api/auth/embed-token/revoke`, undefined, 10_000, {
-          Authorization: `Bearer ${accessToken}`,
-        });
+        const headers: Record<string, string> = {};
+        if (record.accessToken && isTokenUsable(record, Date.now(), 0)) {
+          headers.Authorization = `Bearer ${record.accessToken}`;
+        }
+        const body = record.refreshToken ? { refresh_token: record.refreshToken } : undefined;
+        await requestJson('POST', `${this.orchestratorUrl}/api/auth/embed-token/revoke`, body, 10_000, headers);
       } catch (err) {
         this.log(`Sign-out server revoke failed (clearing locally anyway): ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     await this.clearToken();
     this.stopPolling();
+    this._cancelRefreshTimer();
   }
 
   dispose(): void {
     this.stopPolling();
+    this._cancelRefreshTimer();
+    this.secretChangeSub.dispose();
     this._onTokenReceived.dispose();
+    this._onSessionEnded.dispose();
   }
 
   private _beginPolling(session: DeviceCodeSession): void {
@@ -196,6 +309,8 @@ export class DevicePairingProvider implements vscode.Disposable {
       }
       if (outcome.status === 'approved') {
         await this._storeToken(outcome.token);
+        this.refreshFailures = 0;
+        this._armRefreshTimer(outcome.token);
         this.log('Embedded token received and stored.');
         this._onTokenReceived.fire(outcome.token);
         return;
@@ -214,5 +329,62 @@ export class DevicePairingProvider implements vscode.Disposable {
 
   private async _storeToken(token: EmbeddedTokenRecord): Promise<void> {
     await this.secrets.store(SECRET_KEY, JSON.stringify(token));
+  }
+
+  /** Raw storage read: returns whatever record is stored, expired or not. */
+  private async _readStoredRecord(): Promise<EmbeddedTokenRecord | undefined> {
+    const raw = await this.secrets.get(SECRET_KEY);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw) as EmbeddedTokenRecord;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Converges this window on whatever record is in shared storage (called on
+   * construction and on every {@link vscode.SecretStorage.onDidChange} for
+   * our key). A refresh-capable record re-arms the silent-refresh timer off
+   * its expiry — another window rotating the pair is adopted, never treated
+   * as a session end. A deleted / refresh-less record just cancels the
+   * timer; ending the session (events, UX) is the job of whichever window
+   * observed the authoritative 401 or performed the sign-out.
+   */
+  private async _adoptStoredRecord(): Promise<void> {
+    const record = await this._readStoredRecord();
+    if (!record?.refreshToken) {
+      this._cancelRefreshTimer();
+      return;
+    }
+    this.refreshFailures = 0;
+    this._armRefreshTimer(record);
+  }
+
+  /** Schedules the next silent refresh 60 s before the access token expires (clamped ≥ 1 s — see {@link nextRefreshDelayMs}). */
+  private _armRefreshTimer(record: EmbeddedTokenRecord): void {
+    this._cancelRefreshTimer();
+    if (!record.refreshToken) return;
+    const delay = nextRefreshDelayMs(record.expiresAt, Date.now());
+    this.refreshTimer = setTimeout(() => {
+      void this.refreshNow();
+    }, delay);
+  }
+
+  /** Schedules a retry after a transient refresh failure, on bounded exponential backoff. */
+  private _armRetryBackoff(): void {
+    this._cancelRefreshTimer();
+    const delay = refreshRetryDelayMs(this.refreshFailures);
+    this.refreshFailures += 1;
+    this.refreshTimer = setTimeout(() => {
+      void this.refreshNow();
+    }, delay);
+  }
+
+  private _cancelRefreshTimer(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
   }
 }

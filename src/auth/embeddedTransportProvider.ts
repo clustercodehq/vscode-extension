@@ -11,9 +11,9 @@ const CLI_SSO_LOGIN_COMMAND = 'clustercode login';
 
 /**
  * Default {@link EmbeddedTransportProvider}: injects the stored embedded
- * bearer token as `Authorization: Bearer <token>` on every request, and on a
- * 401 falls back to CLI SSO — see {@link HTTPTransport.refresh} for why this
- * doesn't attempt a silent token refresh yet.
+ * bearer token as `Authorization: Bearer <token>` on every request; on a 401
+ * it attempts one silent refresh ({@link HTTPTransport.refresh}) and retries
+ * once, falling back to CLI SSO only when no refreshed token materializes.
  */
 export class HTTPTransport implements EmbeddedTransportProvider {
   constructor(
@@ -56,19 +56,24 @@ export class HTTPTransport implements EmbeddedTransportProvider {
   }
 
   /**
-   * The device-code pairing flow currently mints a short-TTL bearer token
-   * with no accompanying refresh grant (the poll response carries only
-   * `access_token`/`expires_in`) — there is nothing to silently refresh
-   * yet, so this always falls through to the CLI SSO fallback. Kept as its
-   * own method so a future refresh capability can be wired in here without
-   * changing call sites in {@link request}.
+   * Rotates the stored token pair via the pairing provider's single-flight
+   * {@link DevicePairingProvider.refreshNow}. Resolves the fresh record on
+   * success; resolves `undefined` when the session authoritatively ended
+   * (401 — the provider clears storage and fires `onSessionEnded`) or on a
+   * transient failure (endpoint absent / 5xx / network — session and stored
+   * token kept), letting {@link request} fall through to the CLI SSO
+   * fallback.
    */
   private async refresh(): Promise<EmbeddedTokenRecord | undefined> {
-    return undefined;
+    return this.pairing.refreshNow();
   }
 
   private async _fallbackToCliSso(): Promise<void> {
-    await this.pairing.clearToken();
+    // Deliberately does NOT clear the stored record: on a transient refresh
+    // failure (endpoint absent during rollout, 5xx, network) the refresh
+    // token is still valid — deleting it would destroy the salvage path the
+    // provider's backoff timer retries. On an authoritative session end the
+    // provider has already cleared storage itself.
     const terminal = vscode.window.createTerminal('ClusterCode: Login');
     terminal.show();
     terminal.sendText(CLI_SSO_LOGIN_COMMAND);
