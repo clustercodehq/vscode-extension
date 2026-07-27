@@ -98,6 +98,15 @@ export class ClusterCodePanel {
   ) {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
+      // Re-check auth on the already-open panel so "ClusterCode: Open" recovers
+      // a dead session instead of just refocusing it. When the webview's own
+      // keep-alive has raised the blocking "Session ended" overlay (its 5-min
+      // poll 401'd) but this host's ~9-min silent-refresh loop hasn't yet
+      // dropped the panel to the Sign-In screen, a bare reveal() would leave
+      // the stale overlay up — the exact dead-end the overlay tells the user to
+      // "reopen the console" to escape. Re-rendering drops a revoked session to
+      // Sign-In (and simply re-renders the console for a still-valid one).
+      void ClusterCodePanel.currentPanel._checkAndRender();
       return;
     }
 
