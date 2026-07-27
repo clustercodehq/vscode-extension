@@ -3,25 +3,62 @@ import * as http from 'http';
 import * as https from 'https';
 import * as crypto from 'crypto';
 import { isAllowedExternalUrl } from './url-guard';
-import { resolveOrchestratorUrl, distinctOrigins } from './orchestrator-url';
+import { resolveOrchestratorUrl, distinctOrigins, buildEmbedUrl, safeHttpOrigin } from './orchestrator-url';
 
-type PanelState = 'loading' | 'running' | 'not-running';
+type PanelState = 'loading' | 'running' | 'signed-out' | 'not-running';
+
+/**
+ * Returns the current embedded bearer token (if any), used only to decide
+ * whether to render the 'running' console or the 'signed-out' Sign-In
+ * screen. Returns undefined when the user hasn't paired yet, or the token
+ * has expired/been revoked.
+ */
+export type EmbedTokenGetter = () => Promise<{ accessToken: string; expiresAt: number } | undefined>;
+
+/**
+ * Mints a single-use bootstrap code that the webview iframe exchanges (via
+ * `${orchestratorUrl}/embed?bc=<code>`) for an HttpOnly session cookie. The
+ * embed token itself is never handed to the webview.
+ */
+export type BootstrapCodeGetter = () => Promise<string>;
+
+/**
+ * Origins — beyond the orchestrator itself — the embedded console may load in a
+ * frame: the auth provider's (Clerk) sign-in iframe, for flows that inject one.
+ * Kept in the webview CSP `frame-src` so those flows never fail. Static by
+ * design: there is no user-facing setting (an "extra frame origins" knob only
+ * invited confusion and implied allowed pages could fail to load).
+ */
+const AUTH_FRAME_ORIGINS = ['https://*.clerk.accounts.dev', 'https://*.clerk.com'];
 
 export class ClusterCodePanel {
   static currentPanel: ClusterCodePanel | undefined;
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
   private _orchestratorUrl: string;
-  private _frameOrigins: string[] = [];
   private _clipboardServer: http.Server | null = null;
   private _clipboardPort = 0;
   private _clipboardToken = '';
+  private _getEmbeddedToken?: EmbedTokenGetter;
+  private _getBootstrapCode?: BootstrapCodeGetter;
+  private _log?: (message: string) => void;
+  /** Set by `_renderReachable` just before switching to 'running'; consumed once when building the iframe src. */
+  private _bootstrapCode?: string;
   private readonly _isDev: boolean;
   private _pollTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private constructor(panel: vscode.WebviewPanel, isDev: boolean) {
+  private constructor(
+    panel: vscode.WebviewPanel,
+    isDev: boolean,
+    getEmbeddedToken?: EmbedTokenGetter,
+    getBootstrapCode?: BootstrapCodeGetter,
+    log?: (message: string) => void
+  ) {
     this._panel = panel;
     this._isDev = isDev;
+    this._getEmbeddedToken = getEmbeddedToken;
+    this._getBootstrapCode = getBootstrapCode;
+    this._log = log;
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     this._panel.webview.onDidReceiveMessage(
@@ -55,15 +92,24 @@ export class ClusterCodePanel {
     }
   }
 
-  static onConfigChanged() {
-    if (ClusterCodePanel.currentPanel) {
-      ClusterCodePanel.currentPanel._checkAndRender();
-    }
-  }
-
-  static createOrShow(extensionUri: vscode.Uri, isDev = false) {
+  static createOrShow(
+    extensionUri: vscode.Uri,
+    isDev = false,
+    getEmbeddedToken?: EmbedTokenGetter,
+    getBootstrapCode?: BootstrapCodeGetter,
+    log?: (message: string) => void
+  ) {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
+      // Re-check auth on the already-open panel so "ClusterCode: Open" recovers
+      // a dead session instead of just refocusing it. When the webview's own
+      // keep-alive has raised the blocking "Session ended" overlay (its 5-min
+      // poll 401'd) but this host's ~9-min silent-refresh loop hasn't yet
+      // dropped the panel to the Sign-In screen, a bare reveal() would leave
+      // the stale overlay up — the exact dead-end the overlay tells the user to
+      // "reopen the console" to escape. Re-rendering drops a revoked session to
+      // Sign-In (and simply re-renders the console for a still-valid one).
+      void ClusterCodePanel.currentPanel._checkAndRender();
       return;
     }
 
@@ -80,7 +126,7 @@ export class ClusterCodePanel {
 
     panel.iconPath = vscode.Uri.joinPath(extensionUri, 'images', 'logo-small.png');
 
-    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev);
+    ClusterCodePanel.currentPanel = new ClusterCodePanel(panel, isDev, getEmbeddedToken, getBootstrapCode, log);
   }
 
   private _setState(state: PanelState) {
@@ -94,14 +140,39 @@ export class ClusterCodePanel {
 
     // ORCHESTRATOR_URL env (developer override for local/UAT) or hosted console.
     this._orchestratorUrl = resolveOrchestratorUrl(process.env.ORCHESTRATOR_URL);
-    const probe = await this._probe(this._orchestratorUrl);
-    this._frameOrigins = probe.origins;
-    if (probe.reachable) {
-      this._setState('running');
-    } else {
+    const reachable = await this._probe(this._orchestratorUrl);
+    if (!reachable) {
       this._setState('not-running');
       this._schedulePoll();
+      return;
     }
+    await this._renderReachable();
+  }
+
+  // Orchestrator is reachable — but the embedded console only shows data with a
+  // valid embed token. Without one (never paired, or signed out / token revoked
+  // or expired), show a native device-code Sign-In screen rather than the
+  // anonymous console shell, which would otherwise look "signed in".
+  //
+  // Signed in additionally requires minting a fresh single-use bootstrap code
+  // (the iframe authenticates via the HttpOnly cookie that code exchanges
+  // for, not the embed token directly). A mint failure — e.g. the token was
+  // revoked server-side since the last check — must degrade to the Sign-In
+  // screen rather than crash the render.
+  private async _renderReachable() {
+    const token = await this._getEmbeddedToken?.();
+    if (!token) {
+      this._setState('signed-out');
+      return;
+    }
+    try {
+      this._bootstrapCode = await this._getBootstrapCode?.();
+    } catch (e) {
+      this._log?.(`bootstrap code fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+      this._setState('signed-out');
+      return;
+    }
+    this._setState('running');
   }
 
   // Instead of a Retry button, quietly re-probe while the not-running screen is
@@ -119,10 +190,9 @@ export class ClusterCodePanel {
   }
 
   private async _poll() {
-    const probe = await this._probe(this._orchestratorUrl);
-    if (probe.reachable) {
-      this._frameOrigins = probe.origins;
-      this._setState('running');
+    const reachable = await this._probe(this._orchestratorUrl);
+    if (reachable) {
+      await this._renderReachable();
     } else {
       this._schedulePoll();
     }
@@ -139,8 +209,18 @@ export class ClusterCodePanel {
 
     return new Promise((resolve) => {
       const server = http.createServer(async (req, res) => {
-        // CORS — the orchestrator iframe is on a different origin
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        // CORS — the only legitimate caller is the embedded webview, which
+        // runs at the orchestrator's origin. Recomputed per request (not
+        // cached at server-start) so a reload that changes the orchestrator
+        // URL picks it up. Fails CLOSED: if the current orchestrator URL
+        // isn't a well-formed http(s) origin, no Access-Control-Allow-Origin
+        // header is sent at all — never "*", and never the literal string
+        // "null" that a scheme-less URL like "localhost:3000" would produce.
+        // The X-Token check below is still the real per-request guard.
+        const allowedOrigin = safeHttpOrigin(this._orchestratorUrl);
+        if (allowedOrigin) {
+          res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+        }
         res.setHeader('Access-Control-Allow-Headers', 'X-Token, Content-Type');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
 
@@ -233,73 +313,37 @@ export class ClusterCodePanel {
   }
 
   /**
-   * Probes the orchestrator, following its redirect chain (e.g. an
-   * unauthenticated request bouncing to a portal login on another origin).
-   * Returns whether it is reachable (first request got any response) and the
-   * distinct origins touched, so the webview CSP frame-src can permit the
-   * iframe to actually follow that redirect.
+   * Checks whether the embedded console is reachable. The embed route serves
+   * a self-contained anonymous shell with no redirect to chase, so a single
+   * request is enough — any response at all means the orchestrator is up.
    */
-  private _probe(startUrl: string, maxHops = 5): Promise<{ reachable: boolean; origins: string[] }> {
-    const visited: string[] = [];
-    let reachable = false;
-
-    const visit = (current: string, hops: number): Promise<void> =>
-      new Promise((resolve) => {
-        let isHttps: boolean;
-        try {
-          isHttps = new URL(current).protocol === 'https:';
-        } catch {
-          resolve();
-          return;
-        }
-        visited.push(current);
-        // http.get cannot speak TLS — pick the client by protocol so an
-        // https orchestrator (e.g. the hosted console) is reachable.
-        const req = (isHttps ? https : http).get(current, { timeout: 2000 }, (res) => {
-          res.resume();
-          if (hops === 0) reachable = true; // first response = orchestrator is up
-          const location = res.headers.location;
-          const code = res.statusCode ?? 0;
-          if (location && code >= 300 && code < 400 && hops < maxHops) {
-            let next: string;
-            try {
-              next = new URL(location, current).toString();
-            } catch {
-              resolve();
-              return;
-            }
-            visit(next, hops + 1).then(resolve);
-          } else {
-            resolve();
-          }
-        });
-        req.on('error', () => resolve());
-        req.on('timeout', () => {
-          req.destroy();
-          resolve();
-        });
+  private _probe(orchestratorUrl: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let target: string;
+      let isHttps: boolean;
+      try {
+        target = buildEmbedUrl(orchestratorUrl, {});
+        isHttps = new URL(target).protocol === 'https:';
+      } catch {
+        resolve(false);
+        return;
+      }
+      // http.get cannot speak TLS — pick the client by protocol so an https
+      // orchestrator (e.g. the hosted console) is reachable.
+      const req = (isHttps ? https : http).get(target, { timeout: 2000 }, (res) => {
+        res.resume();
+        resolve(true);
       });
-
-    return visit(startUrl, 0).then(() => ({ reachable, origins: distinctOrigins(visited) }));
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(false);
+      });
+    });
   }
 
   private async _handleMessage(msg: { command: string; text?: string }) {
     switch (msg.command) {
-      case 'startOrchestrator': {
-        const term = vscode.window.createTerminal('ClusterCode: Login');
-        term.show();
-        term.sendText('clustercode login');
-        break;
-      }
-      case 'startWorker': {
-        const term = vscode.window.createTerminal({
-          name: 'ClusterCode: Worker',
-          env: { ORCHESTRATOR_URL: this._orchestratorUrl },
-        });
-        term.show();
-        term.sendText('clustercode worker');
-        break;
-      }
       case 'clipboardWrite':
         if (msg.text) {
           await vscode.env.clipboard.writeText(msg.text);
@@ -310,6 +354,12 @@ export class ClusterCodePanel {
         this._panel.webview.postMessage({ type: 'clipboardPaste', text });
         break;
       }
+      case 'pairDevice':
+        // The Sign-In screen's button — kick off the device-code flow. On
+        // success the onPairingCompleted listener reloads this panel, swapping
+        // the Sign-In screen for the console.
+        void vscode.commands.executeCommand('clustercode.pairDevice');
+        break;
     }
   }
 
@@ -334,16 +384,10 @@ export class ClusterCodePanel {
     const nonce = this._nonce();
     // Allow fetch to the clipboard server
     const cbOrigin = this._clipboardPort ? `http://127.0.0.1:${this._clipboardPort}` : '';
-    // Allow the orchestrator origin plus any origins it redirects to (e.g. a
-    // portal login), plus configured extras for JS-injected frames such as the
-    // Clerk auth iframe, so the embedded app can complete its auth flow.
-    const redirectOrigins = this._frameOrigins.length
-      ? this._frameOrigins
-      : [this._orchestratorUrl];
-    const extraFrameOrigins = vscode.workspace
-      .getConfiguration('clustercode')
-      .get<string[]>('extraFrameOrigins', []);
-    const frameSrc = [...new Set([...redirectOrigins, ...extraFrameOrigins])].join(' ');
+    // Allow the orchestrator origin, plus the auth-provider frame origins
+    // (AUTH_FRAME_ORIGINS) for a sign-in iframe the embedded console may inject.
+    const orchestratorOrigins = distinctOrigins([this._orchestratorUrl]);
+    const frameSrc = [...new Set([...orchestratorOrigins, ...AUTH_FRAME_ORIGINS])].join(' ');
     const csp = [
       `default-src 'none'`,
       `frame-src ${frameSrc}`,
@@ -404,17 +448,18 @@ export class ClusterCodePanel {
 </html>`;
     }
 
-    // Pass clipboard server URL and theme to the orchestrator via query params
-    const vscTheme = this._resolveVscTheme(vscode.window.activeColorTheme.kind);
-    const params = [`_vscTheme=${vscTheme}`];
-    if (this._clipboardPort) {
-      params.push(`_cbUrl=${encodeURIComponent(`http://127.0.0.1:${this._clipboardPort}`)}`);
-      params.push(`_cbToken=${this._clipboardToken}`);
-    }
-    const separator = this._orchestratorUrl.includes('?') ? '&' : '?';
-    const iframeSrc = `${this._orchestratorUrl}${separator}${params.join('&')}`;
-
     if (state === 'running') {
+      // Pass clipboard server URL and theme to the embedded console via query params.
+      const vscTheme = this._resolveVscTheme(vscode.window.activeColorTheme.kind);
+      const embedParams: Record<string, string> = { _vscTheme: vscTheme };
+      if (this._bootstrapCode) {
+        embedParams.bc = this._bootstrapCode;
+      }
+      if (this._clipboardPort) {
+        embedParams._cbUrl = `http://127.0.0.1:${this._clipboardPort}`;
+        embedParams._cbToken = this._clipboardToken;
+      }
+      const iframeSrc = buildEmbedUrl(this._orchestratorUrl, embedParams);
       return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -444,20 +489,70 @@ export class ClusterCodePanel {
 </html>`;
     }
 
-    // not-running
-    const wsScheme = this._orchestratorUrl.startsWith('https') ? 'wss' : 'ws';
-    const workerWsUrl = `${wsScheme}://${new URL(this._orchestratorUrl).host}/ws/worker`;
-    // The URL fields are diagnostic only — shown in development (F5) runs, hidden
-    // in a production-built/installed extension.
-    const devFields = this._isDev ? /* html */ `
-    <div class="url-field">
-      <label>Orchestrator URL</label>
-      <input type="text" value="${this._orchestratorUrl}" readonly />
+    if (state === 'signed-out') {
+      // Native Sign-In screen. The button triggers the device-code flow (opens
+      // the approval page in the system browser) — NOT a Clerk/login form,
+      // which can't work inside the cookie-less, postMessage-blocked webview.
+      return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  ${styles}
+  <style>
+    body { display: flex; align-items: center; justify-content: center; overflow-y: auto; }
+    .container { max-width: 460px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; }
+    .header { display: flex; align-items: center; gap: 12px; }
+    .icon { font-size: 26px; }
+    .heading { font-size: 18px; font-weight: 600; color: var(--text-primary); }
+    .message { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+    .btn-primary {
+      margin-top: 4px;
+      padding: 8px 22px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      background: #10c0f0;
+      color: #ffffff;
+      transition: background 0.15s;
+    }
+    .btn-primary:hover { background: #0eb2df; }
+    body.vscode-light .btn-primary { background: #0080e0; }
+    body.vscode-light .btn-primary:hover { background: #0072c9; }
+    .hint { font-size: 11px; color: var(--text-secondary); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <span class="icon">🔐</span>
+      <span class="heading">Sign in to ClusterCode</span>
     </div>
-    <div class="url-field">
-      <label>Worker WebSocket URL</label>
-      <input type="text" value="${workerWsUrl}" readonly />
-    </div>` : '';
+    <div class="message">Connect this VS Code instance to your ClusterCode account to open the console.</div>
+    <button id="signin" class="btn-primary">Sign In</button>
+    <div class="hint">Opens your browser to approve the connection.</div>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    document.getElementById('signin').addEventListener('click', () => {
+      vscode.postMessage({ command: 'pairDevice' });
+    });
+  </script>
+</body>
+</html>`;
+    }
+
+    // not-running
+    // The orchestrator URL is diagnostic-only, and only meaningful once a
+    // developer has pointed the extension at a self-hosted instance via the
+    // ORCHESTRATOR_URL env var — the default hosted console needs no such
+    // hint for a normal user. Hidden entirely otherwise.
+    const selfHosted = !!process.env.ORCHESTRATOR_URL;
+    const devFields = selfHosted ? /* html */ `
+    <div class="diagnostic">Trying <code>${this._orchestratorUrl}</code></div>` : '';
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -466,57 +561,17 @@ export class ClusterCodePanel {
   ${styles}
   <style>
     body { display: flex; align-items: center; justify-content: center; overflow-y: auto; }
-    .container { max-width: 560px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; gap: 28px; }
+    .container { max-width: 560px; width: 100%; padding: 40px 24px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 16px; }
     .header { display: flex; align-items: center; gap: 12px; }
     .icon { font-size: 28px; }
     .heading { font-size: 18px; font-weight: 600; color: var(--warning); }
-    .section { display: flex; flex-direction: column; gap: 8px; }
-    .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); }
-    pre {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 10px 14px;
+    .message { font-size: 13px; color: var(--text-secondary); }
+    .diagnostic { font-size: 11px; color: var(--text-secondary); }
+    .diagnostic code {
       font-family: var(--vscode-editor-font-family, 'Cascadia Code', monospace);
-      font-size: 12px;
       color: var(--accent-teal);
-      overflow-x: auto;
     }
-    .note { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
-    .url-field { display: flex; flex-direction: column; gap: 6px; }
-    .url-field label { font-size: 12px; color: var(--text-secondary); }
-    .url-field input {
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: 3px;
-      padding: 6px 10px;
-      font-family: var(--vscode-editor-font-family, 'Cascadia Code', monospace);
-      font-size: 12px;
-      color: var(--text-primary);
-      outline: none;
-    }
-    .url-field input:focus { border-color: var(--status-bar); }
-    .buttons { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-    button {
-      padding: 8px 16px;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      font-family: inherit;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s;
-    }
-    /* Primary = ClusterCode brand cyan to match the app; theme-aware so the
-       label stays legible in both light and dark (the old --statusBar-based
-       style rendered white-on-light and vanished in light themes). */
-    .btn-primary { background: #10c0f0; color: #ffffff; }
-    .btn-primary:hover { background: #0eb2df; }
-    body.vscode-light .btn-primary { background: #0080e0; }
-    body.vscode-light .btn-primary:hover { background: #0072c9; }
-    .btn-secondary { background: transparent; color: var(--text-primary); border-color: var(--border); }
-    .btn-secondary:hover { background: var(--bg-secondary); }
-    .waiting { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+    .waiting { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
     .waiting .dot {
       width: 13px; height: 13px;
       border: 2px solid var(--border);
@@ -531,43 +586,20 @@ export class ClusterCodePanel {
   <div class="container">
     <div class="header">
       <span class="icon">⚠️</span>
-      <span class="heading">ClusterCode Orchestrator is not running</span>
+      <span class="heading">Can't reach ClusterCode</span>
     </div>
 
-    <div class="section">
-      <div class="section-title">Install CLI</div>
-      <pre>npm install -g @clustercode/cli</pre>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Getting Started</div>
-      <pre>clustercode login</pre>
-      <div class="note">Authenticate with your ClusterCode account</div>
-      <pre>clustercode worker</pre>
-      <div class="note">Configure tenant and start the worker</div>
-      <pre>clustercode onboard</pre>
-      <div class="note">Guided setup wizard (handles everything)</div>
-    </div>
+    <div class="message">The ClusterCode console isn't responding.</div>
 
     ${devFields}
 
-    <div class="buttons">
-      <button class="btn-primary" data-cmd="startOrchestrator">Start Orchestrator</button>
-      <button class="btn-secondary" data-cmd="startWorker">Start Worker Agent</button>
-    </div>
-
     <div class="waiting">
       <span class="dot"></span>
-      <span>Waiting for the orchestrator… this panel will connect automatically.</span>
+      <span>Retrying automatically…</span>
     </div>
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    document.querySelectorAll('[data-cmd]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        vscode.postMessage({ command: btn.dataset.cmd });
-      });
-    });
     document.addEventListener('keydown', (e) => {
       if (!(e.metaKey || e.ctrlKey)) return;
       const el = document.activeElement;

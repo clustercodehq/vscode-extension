@@ -1,7 +1,7 @@
 {
-  "name": "clustercode-vscode-extension",
+  "name": "clustercode",
   "displayName": "ClusterCode",
-  "description": "Open the ClusterCode orchestrator inside VS Code",
+  "description": "Run and monitor your ClusterCode AI coding agents without leaving VS Code.",
   "version": "0.1.0",
   "publisher": "clustercode",
   "license": "Apache-2.0",
@@ -9,18 +9,43 @@
     "type": "git",
     "url": "https://github.com/clustercodehq/vscode-extension"
   },
+  "bugs": {
+    "url": "https://github.com/clustercodehq/support/issues"
+  },
+  "homepage": "https://clustercode.io",
   "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#10c0f0",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
   "categories": [
+    "AI",
     "Other"
+  ],
+  "keywords": [
+    "clustercode",
+    "ai",
+    "agents",
+    "devbox",
+    "coding-agent"
   ],
   "activationEvents": [
     "onCommand:clustercode.open",
-    "onCommand:clustercode.reload"
+    "onCommand:clustercode.reload",
+    "onCommand:clustercode.pairDevice",
+    "onCommand:clustercode.signOut"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "Signs in to ClusterCode and opens the console webview (a remote orchestrator page). It does not read, execute, or trust any workspace files, so it runs in untrusted workspaces."
+    },
+    "virtualWorkspaces": true
+  },
   "contributes": {
     "commands": [
       {
@@ -32,24 +57,18 @@
         "command": "clustercode.reload",
         "title": "ClusterCode: Reload",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "clustercode.pairDevice",
+        "title": "ClusterCode: Pair Device",
+        "icon": "$(key)"
+      },
+      {
+        "command": "clustercode.signOut",
+        "title": "ClusterCode: Sign Out",
+        "icon": "$(sign-out)"
       }
     ],
-    "configuration": {
-      "title": "ClusterCode",
-      "properties": {
-        "clustercode.extraFrameOrigins": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "https://*.clerk.accounts.dev",
-            "https://*.clerk.com"
-          ],
-          "description": "Extra origins the embedded orchestrator is allowed to frame (added to the webview CSP frame-src). The orchestrator's own origin and any origins it redirects to are allowed automatically; this is for origins injected by client-side JS — e.g. the Clerk auth iframe. Add your production auth frontend (e.g. https://clerk.yourdomain.com) here if it gets blocked."
-        }
-      }
-    },
     "keybindings": []
   },
   "scripts": {
@@ -57,8 +76,8 @@
     "dev": "node esbuild.config.mjs --watch",
     "package": "npm run build && node scripts/package-ext.mjs",
     "install-ext": "npm run package && node scripts/install-ext.mjs",
-    "uninstall-ext": "code --uninstall-extension clustercode.clustercode-vscode-extension",
-    "test": "tsx --test tests/unit/url-guard.spec.ts tests/unit/orchestrator-url.spec.ts tests/e2e/extension/activation.spec.ts"
+    "uninstall-ext": "code --uninstall-extension clustercode.clustercode",
+    "test": "tsx --test tests/unit/url-guard.spec.ts tests/unit/orchestrator-url.spec.ts tests/unit/deviceFlow.spec.ts tests/unit/devicePairingProvider.spec.ts tests/e2e/extension/activation.spec.ts"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",

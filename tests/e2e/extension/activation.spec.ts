@@ -15,7 +15,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-const EXPECTED_COMMANDS = ['clustercode.open', 'clustercode.reload'];
+const EXPECTED_COMMANDS = [
+  'clustercode.open',
+  'clustercode.reload',
+  'clustercode.pairDevice',
+  'clustercode.signOut',
+];
 
 describe('VS Code Extension', () => {
   it('expected commands are defined in package.json', async () => {
@@ -35,6 +40,24 @@ describe('VS Code Extension', () => {
       assert.ok(
         registeredCommands.includes(expected),
         `Expected command "${expected}" to be registered in package.json`,
+      );
+    }
+  });
+
+  it('every registered command has a matching onCommand activation event', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { dirname, join } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const extensionRoot = join(__dirname, '..', '..', '..');
+    const pkg = JSON.parse(readFileSync(join(extensionRoot, 'package.json'), 'utf-8'));
+
+    const activationEvents: string[] = pkg.activationEvents ?? [];
+    for (const cmd of pkg.contributes.commands as { command: string }[]) {
+      assert.ok(
+        activationEvents.includes(`onCommand:${cmd.command}`),
+        `Command "${cmd.command}" is missing an "onCommand:${cmd.command}" activation event`,
       );
     }
   });
