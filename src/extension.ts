@@ -118,11 +118,6 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('clustercode.reload', () =>
       ClusterCodePanel.reload()
     ),
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('clustercode.extraFrameOrigins')) {
-        ClusterCodePanel.onConfigChanged();
-      }
-    }),
   );
 }
 

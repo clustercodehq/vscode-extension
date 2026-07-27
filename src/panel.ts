@@ -22,6 +22,15 @@ export type EmbedTokenGetter = () => Promise<{ accessToken: string; expiresAt: n
  */
 export type BootstrapCodeGetter = () => Promise<string>;
 
+/**
+ * Origins — beyond the orchestrator itself — the embedded console may load in a
+ * frame: the auth provider's (Clerk) sign-in iframe, for flows that inject one.
+ * Kept in the webview CSP `frame-src` so those flows never fail. Static by
+ * design: there is no user-facing setting (an "extra frame origins" knob only
+ * invited confusion and implied allowed pages could fail to load).
+ */
+const AUTH_FRAME_ORIGINS = ['https://*.clerk.accounts.dev', 'https://*.clerk.com'];
+
 export class ClusterCodePanel {
   static currentPanel: ClusterCodePanel | undefined;
   private readonly _panel: vscode.WebviewPanel;
@@ -78,12 +87,6 @@ export class ClusterCodePanel {
   }
 
   static reload() {
-    if (ClusterCodePanel.currentPanel) {
-      ClusterCodePanel.currentPanel._checkAndRender();
-    }
-  }
-
-  static onConfigChanged() {
     if (ClusterCodePanel.currentPanel) {
       ClusterCodePanel.currentPanel._checkAndRender();
     }
@@ -381,14 +384,10 @@ export class ClusterCodePanel {
     const nonce = this._nonce();
     // Allow fetch to the clipboard server
     const cbOrigin = this._clipboardPort ? `http://127.0.0.1:${this._clipboardPort}` : '';
-    // Allow the orchestrator origin, plus configured extras for JS-injected
-    // frames such as an auth provider's iframe, so the embedded app can
-    // complete flows that need one.
+    // Allow the orchestrator origin, plus the auth-provider frame origins
+    // (AUTH_FRAME_ORIGINS) for a sign-in iframe the embedded console may inject.
     const orchestratorOrigins = distinctOrigins([this._orchestratorUrl]);
-    const extraFrameOrigins = vscode.workspace
-      .getConfiguration('clustercode')
-      .get<string[]>('extraFrameOrigins', []);
-    const frameSrc = [...new Set([...orchestratorOrigins, ...extraFrameOrigins])].join(' ');
+    const frameSrc = [...new Set([...orchestratorOrigins, ...AUTH_FRAME_ORIGINS])].join(' ');
     const csp = [
       `default-src 'none'`,
       `frame-src ${frameSrc}`,

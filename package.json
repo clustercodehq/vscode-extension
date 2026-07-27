@@ -1,7 +1,7 @@
 {
   "name": "clustercode-vscode-extension",
   "displayName": "ClusterCode",
-  "description": "Run and monitor ClusterCode AI coding agents from a tab inside VS Code.",
+  "description": "Run and monitor your ClusterCode AI coding agents without leaving VS Code.",
   "version": "0.1.0",
   "publisher": "clustercode",
   "license": "Apache-2.0",
@@ -14,6 +14,7 @@
     "vscode": "^1.74.0"
   },
   "categories": [
+    "AI",
     "Other"
   ],
   "keywords": [
@@ -60,22 +61,6 @@
         "icon": "$(sign-out)"
       }
     ],
-    "configuration": {
-      "title": "ClusterCode",
-      "properties": {
-        "clustercode.extraFrameOrigins": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [
-            "https://*.clerk.accounts.dev",
-            "https://*.clerk.com"
-          ],
-          "description": "Additional origins the embedded UI is permitted to load in a frame (added to the webview's CSP frame-src). Only needed if an allowed page fails to load."
-        }
-      }
-    },
     "keybindings": []
   },
   "scripts": {
