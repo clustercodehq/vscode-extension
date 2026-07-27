@@ -79,6 +79,21 @@ export class DevicePairingProvider implements vscode.Disposable {
   /** Fires whenever an embedded token has been received and stored — initial pairing AND every silent refresh rotation. */
   readonly onTokenReceived = this._onTokenReceived.event;
 
+  private readonly _onPairingCompleted = new vscode.EventEmitter<EmbeddedTokenRecord>();
+  /**
+   * Fires ONLY when a user-initiated device pairing completes (the poll loop
+   * saw `approved`) — never on a silent refresh rotation. This is the signal to
+   * swap the console panel from the Sign-In screen (or a "session ended"
+   * overlay) straight to the live console. It MUST drive that reload even when
+   * this extension host still believes it is signed in: the webview's own
+   * session can die (its 5-min keep-alive 401s → overlay) while this host's
+   * ~9-min silent-refresh loop hasn't yet observed the revoke, so the returning
+   * token is a fresh pairing, not a rotation. `onTokenReceived` can't carry
+   * that decision — it also fires on every rotation, which must NOT reload (a
+   * reload wipes the embedded console's live state).
+   */
+  readonly onPairingCompleted = this._onPairingCompleted.event;
+
   private readonly _onSessionEnded = new vscode.EventEmitter<void>();
   /**
    * Fires when the server authoritatively ends the session (refresh rejected
@@ -293,6 +308,7 @@ export class DevicePairingProvider implements vscode.Disposable {
     this._cancelRefreshTimer();
     this.secretChangeSub.dispose();
     this._onTokenReceived.dispose();
+    this._onPairingCompleted.dispose();
     this._onSessionEnded.dispose();
   }
 
@@ -328,6 +344,9 @@ export class DevicePairingProvider implements vscode.Disposable {
         this._armRefreshTimer(outcome.token);
         this.log('Embedded token received and stored.');
         this._onTokenReceived.fire(outcome.token);
+        // A user-initiated pairing (vs. a silent rotation, which fires only
+        // onTokenReceived): signal the panel to swap to the live console.
+        this._onPairingCompleted.fire(outcome.token);
         return;
       }
       this.log(`Device pairing ended: ${outcome.status}.`);

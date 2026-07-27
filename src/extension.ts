@@ -47,13 +47,7 @@ export function activate(context: vscode.ExtensionContext) {
   // tell a returning, already-paired user they're signed in without forcing a
   // fresh device-code round-trip. We do NOT auto-start a pairing here: doing so
   // on every activation would spam new codes at users who never asked to sign in.
-  // `wasSignedIn` latches the last known auth state so onTokenReceived can
-  // distinguish a signed-out→signed-in transition (show the console, toast)
-  // from a silent refresh rotation (~every 9 min — must NOT reload the panel
-  // or re-toast, which would wipe the embedded console's state).
-  let wasSignedIn = false;
   const setSignedIn = (signedIn: boolean) => {
-    wasSignedIn = signedIn;
     void vscode.commands.executeCommand('setContext', 'clustercode.signedIn', signedIn);
   };
   void devicePairing.isSignedIn().then((signedIn) => {
@@ -79,11 +73,20 @@ export function activate(context: vscode.ExtensionContext) {
     authOutput,
     devicePairing,
     devicePairing.onTokenReceived(() => {
-      const isNewSignIn = !wasSignedIn;
+      // Fires on the initial pairing AND every silent refresh rotation (~every
+      // 9 min). Only reflect signed-in state here — do NOT reload the panel or
+      // toast, which on a rotation would wipe the embedded console's live state.
       setSignedIn(true);
-      if (!isNewSignIn) return; // Silent refresh rotation — nothing user-visible to do.
-      // If the console panel is open (e.g. on the Sign-In screen), reload it so
-      // a successful pairing swaps straight to the console.
+    }),
+    devicePairing.onPairingCompleted(() => {
+      // A user-initiated device pairing finished (Sign In / Pair Device, or a
+      // re-pair after the session ended). Swap the open panel straight to the
+      // console and toast — ALWAYS, regardless of prior signed-in state. The
+      // webview's session can die (its keep-alive 401s → "session ended"
+      // overlay) while this host's silent-refresh loop still believes it's
+      // signed in, so gating this on a signed-out→signed-in transition would
+      // strand a re-pair behind the stale overlay until a manual reload.
+      setSignedIn(true);
       ClusterCodePanel.reload();
       log('Device pairing flow complete.');
       void vscode.window.showInformationMessage('ClusterCode: this VS Code instance is now signed in.');

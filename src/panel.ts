@@ -344,8 +344,8 @@ export class ClusterCodePanel {
       }
       case 'pairDevice':
         // The Sign-In screen's button — kick off the device-code flow. On
-        // success the always-on onTokenReceived listener reloads this panel,
-        // swapping the Sign-In screen for the console.
+        // success the onPairingCompleted listener reloads this panel, swapping
+        // the Sign-In screen for the console.
         void vscode.commands.executeCommand('clustercode.pairDevice');
         break;
     }
