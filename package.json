@@ -30,6 +30,13 @@
     "onCommand:clustercode.signOut"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "Signs in to ClusterCode and opens the console webview (a remote orchestrator page). It does not read, execute, or trust any workspace files, so it runs in untrusted workspaces."
+    },
+    "virtualWorkspaces": true
+  },
   "contributes": {
     "commands": [
       {
