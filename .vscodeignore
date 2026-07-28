@@ -10,3 +10,6 @@ tsconfig.json
 .superpowers/**
 docs/**
 CLAUDE.md
+.claude/**
+.github/**
+**/*.vsix
