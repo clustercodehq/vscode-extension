@@ -318,7 +318,7 @@ export class DevicePairingProvider implements vscode.Disposable {
 
     const tick = async (): Promise<void> => {
       if (Date.now() > deadline) {
-        this.log('Device pairing expired before approval.');
+        this.log('Device pairing expired before approval (client deadline reached).');
         return;
       }
 
@@ -334,10 +334,6 @@ export class DevicePairingProvider implements vscode.Disposable {
         return;
       }
 
-      if (outcome.status === 'pending') {
-        this.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
-        return;
-      }
       if (outcome.status === 'approved') {
         await this._storeToken(outcome.token);
         this.refreshFailures = 0;
@@ -349,7 +345,20 @@ export class DevicePairingProvider implements vscode.Disposable {
         this._onPairingCompleted.fire(outcome.token);
         return;
       }
-      this.log(`Device pairing ended: ${outcome.status}.`);
+      if (outcome.status === 'denied') {
+        // The ONLY server-driven terminal stop: the user explicitly rejected
+        // the pairing. Everything else keeps polling until the deadline.
+        this.log('Device pairing ended: denied by user.');
+        return;
+      }
+      // pending — normal wait, OR a non-authoritative blip (rate-limit, proxy
+      // 5xx, invalid_grant, empty body). Never terminal: keep polling to the
+      // deadline so one stray response can't strand the pairing (the bug that
+      // gave up seconds after start, before the user could approve).
+      if (outcome.reason) {
+        this.log(`Poll not yet approved (${outcome.reason}) — will keep polling until deadline.`);
+      }
+      this.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
     };
 
     this.pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
@@ -357,8 +366,16 @@ export class DevicePairingProvider implements vscode.Disposable {
 
   private async _pollOnce(deviceCode: string): Promise<PollOutcome> {
     const url = `${this.orchestratorUrl}/api/auth/device/poll?device_code=${encodeURIComponent(deviceCode)}`;
-    const { body } = await requestJson<PollResponseBody>('GET', url);
-    return mapPollOutcome(body, Date.now());
+    const { status, body } = await requestJson<PollResponseBody>('GET', url);
+    // Diagnostic: record what each poll actually returned. Control flow no
+    // longer treats a stray response as terminal, so this line is what reveals
+    // WHICH response a flaky poll returned in the field (HTTP status + error).
+    this.log(
+      `Poll response: HTTP ${status}` +
+        (body?.error ? ` error=${body.error}` : '') +
+        (body?.access_token ? ' access_token=present' : '')
+    );
+    return mapPollOutcome(status, body, Date.now());
   }
 
   private async _storeToken(token: EmbeddedTokenRecord): Promise<void> {

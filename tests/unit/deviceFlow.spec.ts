@@ -13,6 +13,7 @@ const NOW = 1_700_000_000_000;
 describe('mapPollOutcome', () => {
   it('maps a present access_token to approved and stamps absolute expiry', () => {
     const outcome = mapPollOutcome(
+      200,
       { access_token: 'est_abc', token_type: 'Bearer', expires_in: 1200 },
       NOW,
     );
@@ -24,34 +25,56 @@ describe('mapPollOutcome', () => {
   });
 
   it('defaults token_type to Bearer and expires_in to 0 when absent', () => {
-    const outcome = mapPollOutcome({ access_token: 'est_abc' }, NOW);
+    const outcome = mapPollOutcome(200, { access_token: 'est_abc' }, NOW);
     assert.ok(outcome.status === 'approved');
     assert.equal(outcome.token.tokenType, 'Bearer');
     assert.equal(outcome.token.expiresAt, NOW);
   });
 
-  it('maps authorization_pending to pending', () => {
-    assert.equal(mapPollOutcome({ error: 'authorization_pending' }, NOW).status, 'pending');
+  it('maps authorization_pending to pending (no diagnostic reason — the expected wait)', () => {
+    const outcome = mapPollOutcome(400, { error: 'authorization_pending' }, NOW);
+    assert.equal(outcome.status, 'pending');
+    assert.ok(outcome.status === 'pending');
+    assert.equal(outcome.reason, undefined);
   });
 
-  it('maps access_denied to denied', () => {
-    assert.equal(mapPollOutcome({ error: 'access_denied' }, NOW).status, 'denied');
+  it('maps access_denied to denied — the only server-driven terminal stop', () => {
+    assert.equal(mapPollOutcome(400, { error: 'access_denied' }, NOW).status, 'denied');
   });
 
-  it('maps expired_token / invalid_grant / unknown errors to terminal expired', () => {
-    assert.equal(mapPollOutcome({ error: 'expired_token' }, NOW).status, 'expired');
-    assert.equal(mapPollOutcome({ error: 'invalid_grant' }, NOW).status, 'expired');
-    assert.equal(mapPollOutcome({ error: 'something_new' }, NOW).status, 'expired');
-    assert.equal(mapPollOutcome({}, NOW).status, 'expired');
+  it('keeps polling (pending) on expired_token / invalid_grant / rate-limit / 5xx / unknown / empty — only a denial or the client deadline stops the loop', () => {
+    // These previously mapped to terminal `expired`, so a single transient blip
+    // permanently aborted an otherwise-live pairing before the user could approve.
+    assert.equal(mapPollOutcome(400, { error: 'expired_token' }, NOW).status, 'pending');
+    assert.equal(mapPollOutcome(400, { error: 'invalid_grant' }, NOW).status, 'pending');
+    assert.equal(mapPollOutcome(429, { error: 'Too many requests' }, NOW).status, 'pending');
+    assert.equal(mapPollOutcome(502, { error: 'something_new' }, NOW).status, 'pending');
+    assert.equal(mapPollOutcome(502, {}, NOW).status, 'pending');
+    assert.equal(mapPollOutcome(200, {}, NOW).status, 'pending');
+  });
+
+  it('carries a diagnostic reason on a non-standard pending (error, else http_<status>, else no_response)', () => {
+    const rateLimited = mapPollOutcome(429, { error: 'Too many requests' }, NOW);
+    assert.ok(rateLimited.status === 'pending');
+    assert.equal(rateLimited.reason, 'Too many requests');
+
+    const emptyBody = mapPollOutcome(502, {}, NOW);
+    assert.ok(emptyBody.status === 'pending');
+    assert.equal(emptyBody.reason, 'http_502');
+
+    const noResponse = mapPollOutcome(0, {}, NOW);
+    assert.ok(noResponse.status === 'pending');
+    assert.equal(noResponse.reason, 'no_response');
   });
 
   it('prefers access_token even if an error field is also present', () => {
-    const outcome = mapPollOutcome({ access_token: 'est_x', error: 'authorization_pending' }, NOW);
+    const outcome = mapPollOutcome(200, { access_token: 'est_x', error: 'authorization_pending' }, NOW);
     assert.equal(outcome.status, 'approved');
   });
 
   it('carries the refresh_token into the stored record when present', () => {
     const outcome = mapPollOutcome(
+      200,
       { access_token: 'est_abc', refresh_token: 'ert_r1', expires_in: 600 },
       NOW,
     );
@@ -60,7 +83,7 @@ describe('mapPollOutcome', () => {
   });
 
   it('leaves refreshToken undefined when the server sends none (old envelope)', () => {
-    const outcome = mapPollOutcome({ access_token: 'est_abc', expires_in: 600 }, NOW);
+    const outcome = mapPollOutcome(200, { access_token: 'est_abc', expires_in: 600 }, NOW);
     assert.ok(outcome.status === 'approved');
     assert.equal(outcome.token.refreshToken, undefined);
   });

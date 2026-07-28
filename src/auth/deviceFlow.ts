@@ -22,7 +22,16 @@ export interface EmbeddedTokenRecord {
 
 export type PollOutcome =
   | { status: 'approved'; token: EmbeddedTokenRecord }
-  | { status: 'pending' | 'denied' | 'expired' };
+  | { status: 'denied' }
+  /**
+   * Keep polling. Covers the normal `authorization_pending` AND every
+   * non-authoritative response (rate-limit, a proxy 5xx, `invalid_grant`,
+   * `expired_token`, an empty/unrecognized body). `reason` is set only for the
+   * non-standard cases so a field flake is visible in the log without changing
+   * control flow. Expiry is decided by the CLIENT deadline, never by treating a
+   * single stray poll response as terminal (see {@link mapPollOutcome}).
+   */
+  | { status: 'pending'; reason?: string };
 
 export interface PollResponseBody {
   access_token?: string;
@@ -33,14 +42,26 @@ export interface PollResponseBody {
 }
 
 /**
- * Maps a raw `device/poll` response body to a {@link PollOutcome}. A present
- * `access_token` means approved; otherwise the OAuth-shaped `error` decides.
- * Anything unrecognized (expired_token / invalid_grant / unknown) is terminal
- * `expired` — nothing more polling can do.
+ * Maps a raw `device/poll` response to a {@link PollOutcome}. A present
+ * `access_token` means approved; an explicit `access_denied` means the user
+ * rejected the pairing. **Every other response keeps the loop polling** —
+ * `authorization_pending` (the expected wait), but also a rate-limit, a proxy
+ * 5xx, `invalid_grant`/`expired_token`, or an empty/unrecognized body.
  *
+ * This is deliberately forgiving. Expiry is enforced by the *client* deadline
+ * (derived from the same `expires_in` the server issued), so a stray poll
+ * response is never authoritative proof the pairing is dead. The previous
+ * version treated any non-`pending` body as terminal `expired`, so a SINGLE
+ * transient blip on any poll (a 429, a CDN 502, a truncated/empty body from the
+ * extension-host network layer) permanently aborted an otherwise-live pairing —
+ * observed in the field as "Device pairing ended: expired" seconds after start,
+ * long before the user could approve.
+ *
+ * @param status HTTP status of the poll response (used only to label the
+ *   diagnostic `reason` when the body carries no OAuth `error`).
  * @param now epoch ms used to stamp the token's absolute `expiresAt`.
  */
-export function mapPollOutcome(body: PollResponseBody, now: number): PollOutcome {
+export function mapPollOutcome(status: number, body: PollResponseBody, now: number): PollOutcome {
   if (body.access_token) {
     return {
       status: 'approved',
@@ -52,9 +73,11 @@ export function mapPollOutcome(body: PollResponseBody, now: number): PollOutcome
       },
     };
   }
-  if (body.error === 'authorization_pending') return { status: 'pending' };
   if (body.error === 'access_denied') return { status: 'denied' };
-  return { status: 'expired' };
+  if (body.error === 'authorization_pending') return { status: 'pending' };
+  // Anything else is non-authoritative — keep polling until the client
+  // deadline. Carry a reason so the flake is greppable in the output channel.
+  return { status: 'pending', reason: body.error ?? (status ? `http_${status}` : 'no_response') };
 }
 
 /**
